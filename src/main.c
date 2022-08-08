@@ -3,6 +3,37 @@
 #include <libdragon.h>
 #include "../libdragon/include/regsinternal.h"
 
+typedef uint64_t xcycle_t;
+
+#define XCYCLE_FROM_COP0(t)  ((t)*4)
+#define XCYCLE_FROM_CPU(t)   ((t)*2)
+#define XCYCLE_FROM_RCP(t)   ((t)*3)
+
+typedef enum {
+    CYCLE_RCP,
+    CYCLE_CPU,
+    CYCLE_COP0,
+} cycletype_t;
+
+typedef enum {
+    UNIT_BYTES
+} unit_t;
+
+struct benchmark_s;
+typedef struct benchmark_s benchmark_t;
+
+typedef struct benchmark_s {
+    xcycle_t (*func)(benchmark_t* b);
+    const char *name;
+    int qty;
+    unit_t unit;
+    cycletype_t cycletype;
+
+    xcycle_t expected;
+    float tolerance;
+    xcycle_t found;
+} benchmark_t;
+
 DEFINE_RSP_UCODE(rsp_bench);
 
 uint8_t rambuf[1024*1024] alignas(64);
@@ -12,41 +43,111 @@ static volatile struct PI_regs_s * const PI_regs = (struct PI_regs_s *)0xa460000
 #define PI_STATUS_DMA_BUSY ( 1 << 0 )
 #define PI_STATUS_IO_BUSY  ( 1 << 1 )
 
-int bench_pidma_single(int size)
-{
-    while (PI_regs->status & (PI_STATUS_DMA_BUSY | PI_STATUS_IO_BUSY)) {}
-    MEMORY_BARRIER();
-    PI_regs->ram_address = rambuf;
-    MEMORY_BARRIER();
-    PI_regs->pi_address = 0x10000000;
-    MEMORY_BARRIER();
-    PI_regs->write_length = size-1;
-    MEMORY_BARRIER();
-    uint32_t t0 = TICKS_READ();
-    while (PI_regs->status & (PI_STATUS_DMA_BUSY | PI_STATUS_IO_BUSY)) {}
-    uint32_t t1 = TICKS_READ();
-    return TICKS_DISTANCE(t0, t1);
+#define TIMEIT(setup, stmt) ({ \
+    MEMORY_BARRIER(); \
+    setup; \
+    uint32_t __t0 = TICKS_READ(); \
+    stmt; \
+    uint32_t __t1 = TICKS_READ(); \
+    MEMORY_BARRIER(); \
+    XCYCLE_FROM_COP0(TICKS_DISTANCE(__t0, __t1)); \
+})
+
+xcycle_t timeit_average(xcycle_t *samples, int n) {
+    int min=0,max=0;
+    for (int i=1;i<n;i++) {
+        if (samples[i] < samples[min]) min=i;
+        if (samples[i] > samples[max]) max=i;
+    }
+    xcycle_t total = 0;
+    for (int i=0;i<n;i++)
+        if (i != min && i != max)
+            total += samples[i];
+    return total / (n-2);
 }
 
-void bench_pidma(void)
-{
-    debugf("PI DMA 8b:   %7d cycles\n", bench_pidma_single(8));
-    debugf("PI DMA 64b:  %7d cycles\n", bench_pidma_single(64));
-    debugf("PI DMA 512b: %7d cycles\n", bench_pidma_single(512));
-    debugf("PI DMA 4k:   %7d cycles\n", bench_pidma_single(4*1024));
-    debugf("PI DMA 16k:  %7d cycles\n", bench_pidma_single(16*1024));
-    debugf("PI DMA 1Mb:  %7d cycles\n", bench_pidma_single(1024*1024));
+#define TIMEIT_MULTI(n, setup, stmt) ({ \
+    int __n = (n); \
+    xcycle_t __samples[__n]; \
+    for (int __i=0; __i < __n; __i++) \
+        __samples[__i] = TIMEIT(setup, stmt); \
+    timeit_average(__samples, __n); \
+})
+
+xcycle_t bench_pidma(benchmark_t* b) {
+    return TIMEIT_MULTI(10, ({
+        PI_regs->ram_address = rambuf;
+        PI_regs->pi_address = 0x10000000;
+        PI_regs->write_length = b->qty-1;
+    }), ({
+        while (PI_regs->status & (PI_STATUS_DMA_BUSY | PI_STATUS_IO_BUSY)) {}
+    }));
 }
+
+xcycle_t bench_piior(benchmark_t* b) {
+    volatile uint32_t *ROM = (volatile uint32_t*)0xB0000000;
+    return TIMEIT_MULTI(50, ({ }), ({ (void)*ROM; }));
+}
+
+xcycle_t bench_piiow(benchmark_t* b) {
+    volatile uint32_t *ROM = (volatile uint32_t*)0xB0000000;
+    return TIMEIT_MULTI(50, ({ 
+        ROM[0] = 0;
+    }), ({  
+        while (PI_regs->status & (PI_STATUS_DMA_BUSY | PI_STATUS_IO_BUSY)) {}
+    }));
+}
+
+/**************************************************************************************/
+
+benchmark_t benchs[] = {
+    { bench_pidma, "PI DMA (default speed)",        8,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(214) },
+    { bench_pidma, "PI DMA (default speed)",      128,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(1617) },
+    { bench_pidma, "PI DMA (default speed)",     1024,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(12213) },
+    { bench_pidma, "PI DMA (default speed)",  64*1024,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(777752) },
+
+    { bench_piior, "PI I/O Read (default speed)",   4,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(144) },
+    { bench_piiow, "PI I/O Write (default speed)",  4,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(144) },
+};
 
 void bench_rsp(void)
 {
+    volatile uint32_t t1;
+    volatile bool finish = false;
+    void sp_done(void) {
+        t1 = TICKS_READ();
+        finish = true;
+    }
+
+    register_SP_handler(sp_done);
     rsp_load(&rsp_bench);
 
+    enable_interrupts();
     uint32_t t0 = TICKS_READ();
-    rsp_run();
-    uint32_t t1 = TICKS_READ();
+    rsp_run_async();
+    while (!finish) {}
 
+    disable_interrupts();
+    unregister_SP_handler(sp_done);
     debugf("RSP loop:    %7ld cycles\n", TICKS_DISTANCE(t0, t1));
+}
+
+const char *cycletype_name(cycletype_t ct) {
+    switch (ct) {
+    case CYCLE_COP0: return "COP0";
+    case CYCLE_CPU: return "CPU";
+    case CYCLE_RCP: return "RCP";
+    default: return "";
+    }
+}
+
+int64_t xcycle_to_cycletype(xcycle_t cycles, cycletype_t ct) {
+    switch (ct) {
+    case CYCLE_COP0: return cycles/4;
+    case CYCLE_CPU: return cycles/2;
+    case CYCLE_RCP: return cycles/3;
+    default: return 0;
+    }
 }
 
 int main(void)
@@ -61,9 +162,35 @@ int main(void)
     disable_interrupts();
     VI_regs->control = 0;
 
-    // Run benchmarks
-    bench_pidma();
-    bench_rsp();
+    const int num_benches = sizeof(benchs) / sizeof(benchmark_t);
+    for (int i=0;i<num_benches;i++) {
+        benchmark_t* b = &benchs[i];
+
+        debugf("*** %s [%d]\n", b->name, b->qty);
+        wait_ms(100);
+
+        // Run the benchmark
+        xcycle_t cycles = b->func(b);
+
+        // Truncate the found value, depending on the exact cycle type it should be expressed in.
+        switch (b->cycletype) {
+        case CYCLE_COP0: cycles = (cycles / 4) * 4; break;
+        case CYCLE_CPU:  cycles = (cycles / 2) * 2; break;
+        case CYCLE_RCP:  cycles = (cycles / 3) * 3; break;
+        }
+        b->found = cycles;
+
+        // Dump the results
+        int64_t expected = xcycle_to_cycletype(b->expected, b->cycletype);
+        int64_t found    = xcycle_to_cycletype(b->found,    b->cycletype);
+
+        debugf("Expected:  %7lld %s cycles\n", expected, cycletype_name(b->cycletype));
+        wait_ms(100);
+        debugf("Found:     %7lld %s cycles\n", found,    cycletype_name(b->cycletype));
+        wait_ms(100);
+        debugf("Diff:      %+7lld (%+02.1f%%)\n", found - expected, (float)(found - expected) * 100.0f / (float)expected);
+        wait_ms(100);
+    }
 
     debugf("Benchmarks done\n");
     console_init();
