@@ -53,6 +53,36 @@ static volatile struct PI_regs_s * const PI_regs = (struct PI_regs_s *)0xa460000
     XCYCLE_FROM_COP0(TICKS_DISTANCE(__t0, __t1)); \
 })
 
+#define TIMEIT_WHILE(setup, stmt, cond) ({ \
+    register uint32_t __t1,__t2,__t3,__t4,__t5,__t6, __t7, __t8; \
+    register bool __c1, __c2, __c3, __c4, __c5, __c6, __c7, __c8; \
+    MEMORY_BARRIER(); \
+    setup; \
+    uint32_t __t0 = TICKS_READ(); \
+    stmt; \
+    do { \
+        __t1 = TICKS_READ(); __c1 = (cond); \
+        __t2 = TICKS_READ(); __c2 = (cond); \
+        __t3 = TICKS_READ(); __c3 = (cond); \
+        __t4 = TICKS_READ(); __c4 = (cond); \
+        __t5 = TICKS_READ(); __c5 = (cond); \
+        __t6 = TICKS_READ(); __c6 = (cond); \
+        __t7 = TICKS_READ(); __c7 = (cond); \
+        __t8 = TICKS_READ(); __c8 = (cond); \
+    } while (__c8); \
+    uint32_t __tend; \
+    if (!__c1) __tend = __t1; \
+    else if (!__c2) __tend = __t2; \
+    else if (!__c3) __tend = __t3; \
+    else if (!__c4) __tend = __t4; \
+    else if (!__c5) __tend = __t5; \
+    else if (!__c6) __tend = __t6; \
+    else if (!__c7) __tend = __t7; \
+    else __tend = __t8; \
+    MEMORY_BARRIER(); \
+    XCYCLE_FROM_COP0(TICKS_DISTANCE(__t0, __tend)); \
+})
+
 xcycle_t timeit_average(xcycle_t *samples, int n) {
     int min=0,max=0;
     for (int i=1;i<n;i++) {
@@ -74,13 +104,22 @@ xcycle_t timeit_average(xcycle_t *samples, int n) {
     timeit_average(__samples, __n); \
 })
 
+#define TIMEIT_WHILE_MULTI(n, setup, stmt, cond) ({ \
+    int __n = (n); \
+    xcycle_t __samples[__n]; \
+    for (int __i=0; __i < __n; __i++) \
+        __samples[__i] = TIMEIT_WHILE(setup, stmt, cond); \
+    timeit_average(__samples, __n); \
+})
+
 xcycle_t bench_pidma(benchmark_t* b) {
-    return TIMEIT_MULTI(10, ({
+    return TIMEIT_WHILE_MULTI(10, ({
         PI_regs->ram_address = rambuf;
         PI_regs->pi_address = 0x10000000;
-        PI_regs->write_length = b->qty-1;
     }), ({
-        while (PI_regs->status & (PI_STATUS_DMA_BUSY | PI_STATUS_IO_BUSY)) {}
+        PI_regs->write_length = b->qty-1;        
+    }), ({
+        PI_regs->status & (PI_STATUS_DMA_BUSY | PI_STATUS_IO_BUSY);
     }));
 }
 
@@ -91,23 +130,23 @@ xcycle_t bench_piior(benchmark_t* b) {
 
 xcycle_t bench_piiow(benchmark_t* b) {
     volatile uint32_t *ROM = (volatile uint32_t*)0xB0000000;
-    return TIMEIT_MULTI(50, ({ 
+    return TIMEIT_WHILE_MULTI(50, ({ }), ({ 
         ROM[0] = 0;
     }), ({  
-        while (PI_regs->status & (PI_STATUS_DMA_BUSY | PI_STATUS_IO_BUSY)) {}
+        PI_regs->status & (PI_STATUS_DMA_BUSY | PI_STATUS_IO_BUSY);
     }));
 }
 
 /**************************************************************************************/
 
 benchmark_t benchs[] = {
-    { bench_pidma, "PI DMA (default speed)",        8,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(214) },
-    { bench_pidma, "PI DMA (default speed)",      128,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(1617) },
-    { bench_pidma, "PI DMA (default speed)",     1024,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(12213) },
-    { bench_pidma, "PI DMA (default speed)",  64*1024,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(777752) },
+    { bench_pidma, "PI DMA (default speed)",        8,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(193) },
+    { bench_pidma, "PI DMA (default speed)",      128,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(1591) },
+    { bench_pidma, "PI DMA (default speed)",     1024,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(12168) },
+    { bench_pidma, "PI DMA (default speed)",  64*1024,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(777807) },
 
     { bench_piior, "PI I/O Read (default speed)",   4,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(144) },
-    { bench_piiow, "PI I/O Write (default speed)",  4,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(144) },
+    { bench_piiow, "PI I/O Write (default speed)",  4,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(134) },
 };
 
 void bench_rsp(void)
