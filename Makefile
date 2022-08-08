@@ -5,7 +5,7 @@ include $(N64_INST)/include/n64.mk
 all: hello.z64
 .PHONY: all
 
-OBJS = $(BUILD_DIR)/main.o
+OBJS = $(BUILD_DIR)/main.o $(BUILD_DIR)/rsp_bench.o
 
 hello.z64: N64_ROM_TITLE="Hello World"
 
