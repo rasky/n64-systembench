@@ -325,6 +325,7 @@ int main(void)
     int passed_5p  = 0;
     int passed_10p = 0;
     int passed_30p = 0;
+    int failed     = 0;
     const int num_benches = sizeof(benchs) / sizeof(benchmark_t);
     for (int i=0;i<num_benches;i++) {
         benchmark_t* b = &benchs[i];
@@ -364,9 +365,10 @@ int main(void)
         if (diff < 0) diff = -diff;
         float pdiff = (float)diff * 100.0f / (float)expected;
         if (diff <= meas_error || pdiff < 0.2f)  b->passed_0p  = true, passed_0p++;
-        if (diff <= meas_error || pdiff < 5.0f)  b->passed_5p  = true, passed_5p++;
-        if (diff <= meas_error || pdiff < 10.0f) b->passed_10p = true, passed_10p++;
-        if (diff <= meas_error || pdiff < 30.0f) b->passed_30p = true, passed_30p++;
+        else if (diff <= meas_error || pdiff < 5.0f)  b->passed_5p  = true, passed_5p++;
+        else if (diff <= meas_error || pdiff < 10.0f) b->passed_10p = true, passed_10p++;
+        else if (diff <= meas_error || pdiff < 30.0f) b->passed_30p = true, passed_30p++;
+        else failed++;
     }
 
     uint32_t colors[5] = { 0xffffffff, 0x8fb93500, 0xe6e22e00, 0xe09c3b00, 0xe6474700 };
@@ -411,7 +413,7 @@ int main(void)
             graphics_draw_text(disp, 200, 110, sbuf);
 
             graphics_set_color(colors[4], 0);
-            sprintf(sbuf, "     Failed: %2d (%3d %%)", num_benches-passed_30p, (num_benches-passed_30p) * 100 / num_benches);
+            sprintf(sbuf, "     Failed: %2d (%3d %%)", failed, failed * 100 / num_benches);
             graphics_draw_text(disp, 200, 120, sbuf);
 
             graphics_set_color(0xFFFFFFFF, 0);
