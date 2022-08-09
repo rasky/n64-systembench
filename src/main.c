@@ -5,13 +5,18 @@
 
 typedef uint64_t xcycle_t;
 
+#define RCP_FREQUENCY            62500000              // N64 & iQue
+#define RCP_FACTOR               9                     // Scaling factor to convert to xcycle
+#define CPU_FACTOR               (RCP_FREQUENCY * RCP_FACTOR / CPU_FREQUENCY)   // CPU Scaling factor (different N64 vs iQue)
+
+#define XCYCLES_PER_SECOND       XCYCLE_FROM_CPU(CPU_FREQUENCY)
+#define XCYCLE_FROM_COP0(t)      ((t) * CPU_FACTOR * 2)
+#define XCYCLE_FROM_CPU(t)       ((t) * CPU_FACTOR)
+#define XCYCLE_FROM_RCP(t)       ((t) * RCP_FACTOR)
+
 #define MEASUREMENT_ERROR_CPU    XCYCLE_FROM_CPU(1)    // Sampling error when measuring CPU cycles
 #define MEASUREMENT_ERROR_RCP    XCYCLE_FROM_CPU(4)    // Sampling error when measuring RCP cycles
 
-#define XCYCLES_PER_SECOND   XCYCLE_FROM_CPU(CPU_FREQUENCY)
-#define XCYCLE_FROM_COP0(t)  ((t)*4)
-#define XCYCLE_FROM_CPU(t)   ((t)*2)
-#define XCYCLE_FROM_RCP(t)   ((t)*3)
 
 typedef enum {
     CYCLE_RCP,
@@ -227,33 +232,6 @@ xcycle_t bench_ram_uncached_r32_multibank(benchmark_t *b) {
 
 /**************************************************************************************/
 
-benchmark_t benchs[] = {
-    { bench_ram_cached_r8,  "RDRAM C8R",     1,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(3) },
-    { bench_ram_cached_r16, "RDRAM C16R",    2,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(3) },
-    { bench_ram_cached_r32, "RDRAM C32R",    4,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(3) },
-    { bench_ram_cached_r64, "RDRAM C64R",    8,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(3) },
-
-    { bench_ram_uncached_r8,  "RDRAM U8R",     1,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(34) },
-    { bench_ram_uncached_r16, "RDRAM U16R",    2,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(34) },
-    { bench_ram_uncached_r32, "RDRAM U32R",    4,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(34) },
-    { bench_ram_uncached_r64, "RDRAM U64R",    8,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(37) },
-
-    { bench_ram_uncached_r32_seq,       "RDRAM U32R seq",    4*4,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(134) },
-    { bench_ram_uncached_r32_random,    "RDRAM U32R rand",   4*4,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(134) },
-    { bench_ram_uncached_r32_multibank, "RDRAM U32R banked", 4*4,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(136) },
-
-    { bench_rcp_io_r, "RCP I/O R",    1,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(24) },
-    // { bench_rcp_io_w, "RCP I/O W",   1,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(193) },  // FIXME: flush buffer
-
-    { bench_pidma, "PI DMA",        8,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(193) },
-    { bench_pidma, "PI DMA",      128,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(1591) },
-    { bench_pidma, "PI DMA",     1024,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(12168) },
-    { bench_pidma, "PI DMA",  64*1024,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(777807) },
-
-    { bench_piior, "PI I/O R",   4,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(144) },
-    { bench_piiow, "PI I/O W",   4,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(134) },
-};
-
 void bench_rsp(void)
 {
     volatile uint32_t t1;
@@ -311,6 +289,33 @@ void format_speed(char *buf, int nbytes, xcycle_t time) {
 
 int main(void)
 {
+    benchmark_t benchs[] = {
+        { bench_ram_cached_r8,  "RDRAM C8R",     1,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(3) },
+        { bench_ram_cached_r16, "RDRAM C16R",    2,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(3) },
+        { bench_ram_cached_r32, "RDRAM C32R",    4,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(3) },
+        { bench_ram_cached_r64, "RDRAM C64R",    8,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(3) },
+
+        { bench_ram_uncached_r8,  "RDRAM U8R",     1,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(34) },
+        { bench_ram_uncached_r16, "RDRAM U16R",    2,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(34) },
+        { bench_ram_uncached_r32, "RDRAM U32R",    4,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(34) },
+        { bench_ram_uncached_r64, "RDRAM U64R",    8,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(37) },
+
+        { bench_ram_uncached_r32_seq,       "RDRAM U32R seq",    4*4,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(134) },
+        { bench_ram_uncached_r32_random,    "RDRAM U32R rand",   4*4,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(134) },
+        { bench_ram_uncached_r32_multibank, "RDRAM U32R banked", 4*4,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(136) },
+
+        { bench_rcp_io_r, "RCP I/O R",    1,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(24) },
+        // { bench_rcp_io_w, "RCP I/O W",   1,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(193) },  // FIXME: flush buffer
+
+        { bench_pidma, "PI DMA",        8,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(193) },
+        { bench_pidma, "PI DMA",      128,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(1591) },
+        { bench_pidma, "PI DMA",     1024,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(12168) },
+        { bench_pidma, "PI DMA",  64*1024,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(777807) },
+
+        { bench_piior, "PI I/O R",   4,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(144) },
+        { bench_piiow, "PI I/O W",   4,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(134) },
+    };
+
     rsp_init();
     debug_init_isviewer();
     debug_init_usblog();
@@ -390,6 +395,9 @@ int main(void)
             graphics_fill_screen(disp, 0);
             graphics_draw_text(disp, 320-70, 10, "n64-systembench");
             graphics_draw_text(disp, 320-70, 20, "v1.0 - by Rasky");
+
+            sprintf(sbuf, "Platform: %s", sys_bbplayer() ? "iQue" : "N64");
+            graphics_draw_text(disp, 270-15, 40, sbuf);
 
             sprintf(sbuf, "Tests: %d", num_benches);
             graphics_draw_text(disp, 270, 50, sbuf);
