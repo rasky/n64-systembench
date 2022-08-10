@@ -8,9 +8,10 @@ typedef uint64_t xcycle_t;
 #define RCP_FREQUENCY            62500000              // N64 & iQue
 #define RCP_FACTOR               9                     // Scaling factor to convert to xcycle
 #define CPU_FACTOR               (RCP_FREQUENCY * RCP_FACTOR / CPU_FREQUENCY)   // CPU Scaling factor (different N64 vs iQue)
+#define COP0_FACTOR              (CPU_FACTOR * 2)
 
 #define XCYCLES_PER_SECOND       XCYCLE_FROM_CPU(CPU_FREQUENCY)
-#define XCYCLE_FROM_COP0(t)      ((t) * CPU_FACTOR * 2)
+#define XCYCLE_FROM_COP0(t)      ((t) * COP0_FACTOR)
 #define XCYCLE_FROM_CPU(t)       ((t) * CPU_FACTOR)
 #define XCYCLE_FROM_RCP(t)       ((t) * RCP_FACTOR)
 
@@ -265,9 +266,9 @@ const char *cycletype_name(cycletype_t ct) {
 
 int64_t xcycle_to_cycletype(xcycle_t cycles, cycletype_t ct) {
     switch (ct) {
-    case CYCLE_COP0: return cycles/4;
-    case CYCLE_CPU: return cycles/2;
-    case CYCLE_RCP: return cycles/3;
+    case CYCLE_COP0: return cycles / COP0_FACTOR;
+    case CYCLE_CPU: return cycles / CPU_FACTOR;
+    case CYCLE_RCP: return cycles / RCP_FACTOR;
     default: return 0;
     }
 }
