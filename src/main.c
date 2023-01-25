@@ -51,8 +51,19 @@ uint8_t rambuf[1024*1024] alignas(64);
 
 static volatile struct VI_regs_s * const VI_regs = (struct VI_regs_s *)0xa4400000;
 static volatile struct PI_regs_s * const PI_regs = (struct PI_regs_s *)0xa4600000;
+static volatile struct SI_regs_s * const SI_regs = (struct SI_regs_s *)0xa4800000;
+
+static volatile void *PIF_ROM = (void *)0x1fc00700;
+static volatile void *PIF_RAM = (void *)0x1fc007c0;
+
+#define PIF
+
 #define PI_STATUS_DMA_BUSY ( 1 << 0 )
 #define PI_STATUS_IO_BUSY  ( 1 << 1 )
+
+#define SI_STATUS_DMA_BUSY ( 1 << 0 )
+#define SI_STATUS_IO_BUSY  ( 1 << 1 )
+#define SI_WSTATUS_INTACK  0
 
 #define TIMEIT(setup, stmt) ({ \
     MEMORY_BARRIER(); \
@@ -167,6 +178,40 @@ xcycle_t bench_piiow(benchmark_t* b) {
     }));
 }
 
+xcycle_t bench_sidmaw_ram(benchmark_t* b) {
+    return TIMEIT_WHILE_MULTI(10, ({
+        SI_regs->DRAM_addr = rambuf;
+    }), ({
+        SI_regs->PIF_addr_write = PIF_RAM;
+    }), ({
+        SI_regs->status & (SI_STATUS_DMA_BUSY | SI_STATUS_IO_BUSY);
+    }));
+}
+
+xcycle_t bench_sidmaw_rom(benchmark_t* b) {
+    return TIMEIT_WHILE_MULTI(10, ({
+        SI_regs->DRAM_addr = rambuf;
+    }), ({
+        SI_regs->PIF_addr_write = PIF_ROM;
+    }), ({
+        SI_regs->status & (SI_STATUS_DMA_BUSY | SI_STATUS_IO_BUSY);
+    }));
+}
+
+xcycle_t bench_siior(benchmark_t* b) {
+    volatile uint32_t *PIF_RAM = (volatile uint32_t*)0xBFC007C0;
+    return TIMEIT_MULTI(50, ({ }), ({ (void)*PIF_RAM; }));
+}
+
+xcycle_t bench_siiow(benchmark_t* b) {
+    volatile uint32_t *PIF_RAM = (volatile uint32_t*)0xBFC007C0;
+    return TIMEIT_WHILE_MULTI(50, ({ }), ({ 
+        PIF_RAM[0] = 0;
+    }), ({  
+        SI_regs->status & (SI_STATUS_DMA_BUSY | SI_STATUS_IO_BUSY);
+    }));
+}
+
 xcycle_t bench_ram_cached_r8(benchmark_t *b) {
     volatile uint8_t *RAM = (volatile uint8_t*)(rambuf);
     return TIMEIT_MULTI(50, ({ (void)*RAM; }), ({ (void)*RAM; }));
@@ -229,6 +274,224 @@ xcycle_t bench_ram_uncached_r32_multibank(benchmark_t *b) {
     volatile uint32_t *RAM2 = (volatile uint32_t*)UncachedAddr(0x80200000);
     volatile uint32_t *RAM3 = (volatile uint32_t*)UncachedAddr(0x80300000);
     return TIMEIT_MULTI(50, ({ }), ({ (void)*RAM0; (void)*RAM1; (void)*RAM2; (void)*RAM3; }));
+}
+
+static void joybus_write(uint64_t *in) {
+    SI_regs->status = SI_WSTATUS_INTACK;
+    SI_regs->DRAM_addr = in;
+    SI_regs->PIF_addr_write = PIF_RAM;
+    while (SI_regs->status & (SI_STATUS_DMA_BUSY | SI_STATUS_IO_BUSY)) {}
+    SI_regs->status = SI_WSTATUS_INTACK;
+}
+static void joybus_read(uint64_t *out) {
+    SI_regs->DRAM_addr = out;
+    SI_regs->PIF_addr_read = PIF_RAM;
+    while (SI_regs->status & (SI_STATUS_DMA_BUSY | SI_STATUS_IO_BUSY)) {}
+}
+
+xcycle_t bench_joybus_empty0(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+    uint64_t *out = UncachedAddr(rambuf+64);
+
+    return TIMEIT_MULTI(50, ({ 
+        buf[0] = 0xfe00000000000000;
+        buf[1] = 0;
+        buf[2] = 0;
+        buf[3] = 0;
+        buf[4] = 0;
+        buf[5] = 0;
+        buf[6] = 0;
+        buf[7] = 1;       
+        joybus_write(buf); 
+    }), ({ joybus_read(out); }));
+}
+
+xcycle_t bench_joybus_empty0b(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+    uint64_t *out = UncachedAddr(rambuf+64);
+
+    return TIMEIT_MULTI(50, ({ 
+        buf[0] = 0x00fe000000000000;
+        buf[1] = 0;
+        buf[2] = 0;
+        buf[3] = 0;
+        buf[4] = 0;
+        buf[5] = 0;
+        buf[6] = 0;
+        buf[7] = 1;       
+        joybus_write(buf); 
+    }), ({ joybus_read(out); }));
+}
+
+xcycle_t bench_joybus_empty0c(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+    uint64_t *out = UncachedAddr(rambuf+64);
+
+    return TIMEIT_MULTI(50, ({ 
+        buf[0] = 0x00000000fe000000;
+        buf[1] = 0;
+        buf[2] = 0;
+        buf[3] = 0;
+        buf[4] = 0;
+        buf[5] = 0;
+        buf[6] = 0;
+        buf[7] = 1;       
+        joybus_write(buf); 
+    }), ({ joybus_read(out); }));
+}
+
+xcycle_t bench_joybus_empty1(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+    uint64_t *out = UncachedAddr(rambuf+64);
+
+    return TIMEIT_MULTI(50, ({ 
+        buf[0] = 0;
+        buf[1] = 0xfe00000000000000;
+        buf[2] = 0;
+        buf[3] = 0;
+        buf[4] = 0;
+        buf[5] = 0;
+        buf[6] = 0;
+        buf[7] = 1;       
+        joybus_write(buf); 
+    }), ({ joybus_read(out); }));
+}
+
+
+xcycle_t bench_joybus_empty4(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+    uint64_t *out = UncachedAddr(rambuf+64);
+
+    return TIMEIT_MULTI(50, ({ 
+        buf[0] = 0;
+        buf[1] = 0;
+        buf[2] = 0;
+        buf[3] = 0;
+        buf[4] = 0xfe00000000000000;
+        buf[5] = 0;
+        buf[6] = 0;
+        buf[7] = 1;
+        joybus_write(buf); 
+    }), ({ joybus_read(out); }));
+}
+
+xcycle_t bench_joybus_empty7(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+    uint64_t *out = UncachedAddr(rambuf+64);
+
+    return TIMEIT_MULTI(50, ({ 
+        buf[0] = 0;
+        buf[1] = 0;
+        buf[2] = 0;
+        buf[3] = 0;
+        buf[4] = 0;
+        buf[5] = 0;
+        buf[6] = 0;
+        buf[7] = 0xfe00000000000001;       
+        joybus_write(buf); 
+    }), ({ joybus_read(out); }));
+}
+
+xcycle_t bench_joybus_empty7e(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+    uint64_t *out = UncachedAddr(rambuf+64);
+
+    return TIMEIT_MULTI(50, ({ 
+        buf[0] = 0;
+        buf[1] = 0;
+        buf[2] = 0;
+        buf[3] = 0;
+        buf[4] = 0;
+        buf[5] = 0;
+        buf[6] = 0;
+        buf[7] = 0x000000000000fe01;       
+        joybus_write(buf); 
+    }), ({ joybus_read(out); }));
+}
+
+xcycle_t bench_joybus_1j(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+    uint64_t *out = UncachedAddr(rambuf+64);
+
+    return TIMEIT_MULTI(50, ({ 
+        buf[0] = 0xff010401ffffffff;
+        buf[1] = 0xfe00000000000000;
+        buf[2] = 0;
+        buf[3] = 0;
+        buf[4] = 0;
+        buf[5] = 0;
+        buf[6] = 0;
+        buf[7] = 1;       
+        joybus_write(buf); 
+    }), ({ joybus_read(out); }));
+}
+
+xcycle_t bench_joybus_2j(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+    uint64_t *out = UncachedAddr(rambuf+64);
+
+    return TIMEIT_MULTI(50, ({ 
+        buf[0] = 0xff010401ffffffff;
+        buf[1] = 0xff010401ffffffff;
+        buf[2] = 0xfe00000000000000;
+        buf[3] = 0;
+        buf[4] = 0;
+        buf[5] = 0;
+        buf[6] = 0;
+        buf[7] = 1;       
+        joybus_write(buf); 
+    }), ({ joybus_read(out); }));
+}
+
+xcycle_t bench_joybus_3j(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+    uint64_t *out = UncachedAddr(rambuf+64);
+
+    return TIMEIT_MULTI(50, ({ 
+        buf[0] = 0xff010401ffffffff;
+        buf[1] = 0xff010401ffffffff;
+        buf[2] = 0xff010401ffffffff;
+        buf[3] = 0xfe00000000000000;
+        buf[4] = 0;
+        buf[5] = 0;
+        buf[6] = 0;
+        buf[7] = 1;       
+        joybus_write(buf); 
+    }), ({ joybus_read(out); }));
+}
+
+xcycle_t bench_joybus_4j(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+    uint64_t *out = UncachedAddr(rambuf+64);
+
+    return TIMEIT_MULTI(50, ({ 
+        buf[0] = 0xff010401ffffffff;
+        buf[1] = 0xff010401ffffffff;
+        buf[2] = 0xff010401ffffffff;
+        buf[3] = 0xff010401ffffffff;
+        buf[4] = 0xfe00000000000000;
+        buf[5] = 0;
+        buf[6] = 0;
+        buf[7] = 1;       
+        joybus_write(buf); 
+    }), ({ joybus_read(out); }));
+}
+
+xcycle_t bench_joybus_access(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+    uint64_t *out = UncachedAddr(rambuf+64);
+
+    return TIMEIT_MULTI(50, ({ 
+        buf[0] = 0xff010300ffffffff;
+        buf[1] = 0xfe00000000000000;
+        buf[2] = 0;
+        buf[3] = 0;
+        buf[4] = 0;
+        buf[5] = 0;
+        buf[6] = 0;
+        buf[7] = 1;       
+        joybus_write(buf); 
+    }), ({ joybus_read(out); }));
 }
 
 /**************************************************************************************/
@@ -315,6 +578,24 @@ int main(void)
 
         { bench_piior, "PI I/O R",   4,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(144) },
         { bench_piiow, "PI I/O W",   4,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(134) },
+
+        { bench_sidmaw_ram, "SI DMA W RAM",  64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(4065) },
+        { bench_sidmaw_rom, "SI DMA W ROM",  64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(2144) },
+        { bench_siior, "SI I/O R",   4,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(1974) },
+        { bench_siiow, "SI I/O W",   4,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(2158) },
+
+        { bench_joybus_empty0,  "JOY: Empty 0B",    64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(15030) },
+        { bench_joybus_empty0b, "JOY: Empty 1B",    64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(16424) },
+        { bench_joybus_empty0c, "JOY: Empty 4B",    64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(20644) },
+        { bench_joybus_empty1,  "JOY: Empty 8B",    64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(21163) },
+        { bench_joybus_empty4,  "JOY: Empty 32B",   64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(21163) },
+        { bench_joybus_empty7,  "JOY: Empty 56B",   64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(21170) },
+        { bench_joybus_empty7e, "JOY: Empty 63B",   64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(21178) },
+        { bench_joybus_1j,      "JOY: 1J",       64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(37987) },
+        { bench_joybus_2j,      "JOY: 2J",       64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(57972) },
+        { bench_joybus_3j,      "JOY: 3J",       64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(77924) },
+        { bench_joybus_4j,      "JOY: 4J",       64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(97890) },
+        { bench_joybus_access,  "JOY: Accessory",64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(36834) },
     };
 
     rsp_init();
@@ -377,10 +658,16 @@ int main(void)
         else failed++;
     }
 
+    enum { BENCH_PER_PAGE = 20 };
     uint32_t colors[5] = { 0xffffffff, 0x8fb93500, 0xe6e22e00, 0xe09c3b00, 0xe6474700 };
     int page = 0;
+    int num_pages = 1 + (num_benches + BENCH_PER_PAGE - 1) / BENCH_PER_PAGE;
 
     debugf("Benchmarks done\n");
+    
+    // ack all pending interrupts
+    SI_regs->status = SI_WSTATUS_INTACK;
+
     enable_interrupts();
     controller_init();
     display_init( RESOLUTION_640x240, DEPTH_32_BPP, 2, GAMMA_NONE, ANTIALIAS_RESAMPLE );
@@ -391,9 +678,16 @@ int main(void)
         controller_scan();
         struct controller_data cont = get_keys_down();
 
+        if (cont.c->start) page = 0;
+        if (cont.c->L) page = (page - 1) % num_pages;
+        if (cont.c->R) page = (page + 1) % num_pages;
+        
+        graphics_fill_screen(disp, 0);
+        sprintf(sbuf, "Page %d/%d", page+1, num_pages);
+        graphics_draw_text(disp, 320-30, 220, sbuf);
+
         switch (page) {
         case 0: { // Summary page
-            graphics_fill_screen(disp, 0);
             graphics_draw_text(disp, 320-70, 10, "n64-systembench");
             graphics_draw_text(disp, 320-70, 20, "v1.0 - by Rasky");
 
@@ -427,19 +721,16 @@ int main(void)
 
             graphics_set_color(0xFFFFFFFF, 0);
 
-            graphics_draw_text(disp, 320-110, 140, "Press START to see details");
+            graphics_draw_text(disp, 320-110, 140, "Press L/R to navigate pages");
 
             display_show(disp);
-            if (cont.c->start) page = 1;
         } break;
         default: { // Details
-            enum { BENCH_PER_PAGE = 20 };
-            graphics_fill_screen(disp, 0);
-
             int y = 10;
             for (int i=0;i<BENCH_PER_PAGE;i++) {
-                if (i >= num_benches) break;
-                benchmark_t* b = &benchs[i];
+                int idx = i + (page-1)*BENCH_PER_PAGE;
+                if (idx >= num_benches) break;
+                benchmark_t* b = &benchs[idx];
                 int64_t expected = xcycle_to_cycletype(b->expected, b->cycletype);
                 int64_t found    = xcycle_to_cycletype(b->found,    b->cycletype);
 
@@ -458,7 +749,6 @@ int main(void)
             graphics_set_color(0xFFFFFFFF, 0);
 
             display_show(disp);
-            if (cont.c->start) page = 0;
         } break;
         }
     }
