@@ -105,34 +105,52 @@ static volatile void *PIF_RAM = (void *)0x1fc007c0;
     XCYCLE_FROM_COP0(TICKS_DISTANCE(__t0, __tend)); \
 })
 
-__attribute__((noinline))
-xcycle_t timeit_average(xcycle_t *samples, int n) {
-    int min=0,max=0;
-    for (int i=1;i<n;i++) {
-        if (samples[i] < samples[min]) min=i;
-        if (samples[i] > samples[max]) max=i;
-    }
-    xcycle_t total = 0;
-    for (int i=0;i<n;i++)
-        if (i != min && i != max)
-            total += samples[i];
-    return total / (n-2);
-}
-
 #define TIMEIT_MULTI(n, setup, stmt) ({ \
     int __n = (n); \
-    xcycle_t __samples[__n]; \
-    for (int __i=0; __i < __n; __i++) \
-        __samples[__i] = TIMEIT(setup, stmt); \
-    timeit_average(__samples, __n); \
+    xcycle_t __total = 0, _min = ~0, _max = 0; \
+    for (int __i=0; __i < __n; __i++) { \
+        xcycle_t result = TIMEIT(setup, stmt); \
+        if(result < _min) { \
+           if(_min != ~0) { \
+              if(_max != 0) __total += _min; \
+              else _max = _min; \
+           } \
+           _min = result; \
+        } \
+        else if(result > _max) { \
+           if(_max != 0) { \
+              if(_min != ~0) __total += _max; \
+              else _min = _max; \
+           } \
+           _max = result; \
+        } \
+        else __total += result; \
+    } \
+    __total / (n-2); \
 })
 
 #define TIMEIT_WHILE_MULTI(n, setup, stmt, cond) ({ \
     int __n = (n); \
-    xcycle_t __samples[__n]; \
-    for (int __i=0; __i < __n; __i++) \
-        __samples[__i] = TIMEIT_WHILE(setup, stmt, cond); \
-    timeit_average(__samples, __n); \
+    xcycle_t __total = 0, _min = ~0, _max = 0; \
+    for (int __i=0; __i < __n; __i++) { \
+        xcycle_t result = TIMEIT_WHILE(setup, stmt, cond); \
+        if(result < _min) { \
+           if(_min != ~0) { \
+              if(_max != 0) __total += _min; \
+              else _max = _min; \
+           } \
+           _min = result; \
+        } \
+        else if(result > _max) { \
+           if(_max != 0) { \
+              if(_min != ~0) __total += _max; \
+              else _min = _max; \
+           } \
+           _max = result; \
+        } \
+        else __total += result; \
+    } \
+    __total / (n-2); \
 })
 
 static inline void fill_out_buffer(void) {
