@@ -1,7 +1,10 @@
+
 #include <stdio.h>
 #include <stdalign.h>
 #include <libdragon.h>
-#include "../libdragon/include/regsinternal.h"
+#include <string.h>
+#include "regsinternal.h"
+#include "rdp_lowlevel.h"
 
 typedef uint64_t xcycle_t;
 
@@ -17,6 +20,9 @@ typedef uint64_t xcycle_t;
 #define MEASUREMENT_ERROR_CPU    XCYCLE_FROM_CPU(1)    // Sampling error when measuring CPU cycles
 #define MEASUREMENT_ERROR_RCP    XCYCLE_FROM_CPU(4)    // Sampling error when measuring RCP cycles
 
+#define AI_NTSC_DACRATE 48681812
+#define AI_PAL_DACRATE  49656530
+#define AI_MPAL_DACRATE 48628316
 
 typedef enum {
     CYCLE_RCP,
@@ -47,11 +53,15 @@ typedef struct benchmark_s {
 DEFINE_RSP_UCODE(rsp_bench);
 
 __attribute__((aligned(64)))
-uint8_t rambuf[1024*1024];
+uint8_t rambuf[1024*1024+16];
 
+static volatile struct SP_regs_s * const SP_regs = (struct SP_regs_s *)0xa4040000;
 static volatile struct VI_regs_s * const VI_regs = (struct VI_regs_s *)0xa4400000;
 static volatile struct PI_regs_s * const PI_regs = (struct PI_regs_s *)0xa4600000;
 static volatile struct SI_regs_s * const SI_regs = (struct SI_regs_s *)0xa4800000;
+
+static volatile uint8_t * const DMEM = (uint8_t *)0xa4000000;
+static volatile uint8_t * const IMEM = (uint8_t *)0xa4001000;
 
 static volatile void *PIF_ROM = (void *)0x1fc00700;
 static volatile void *PIF_RAM = (void *)0x1fc007c0;
@@ -66,10 +76,25 @@ static volatile void *PIF_RAM = (void *)0x1fc007c0;
     MEMORY_BARRIER(); \
     setup; \
     uint32_t __t0 = TICKS_READ(); \
+    asm volatile ( "nop; nop"); \
     stmt; \
+    asm volatile ( "nop; nop"); \
     uint32_t __t1 = TICKS_READ(); \
     MEMORY_BARRIER(); \
-    XCYCLE_FROM_COP0(TICKS_DISTANCE(__t0, __t1)); \
+    XCYCLE_FROM_COP0(TICKS_DISTANCE(__t0, __t1) - 2); \
+})
+
+#define TIMEIT_ODD_DETECTION(setup, stmt) ({ \
+    MEMORY_BARRIER(); \
+    setup; \
+    uint32_t __t0 = TICKS_READ(); \
+    asm volatile ( "nop; nop"); \
+    stmt; \
+    stmt; \
+    asm volatile ( "nop; nop"); \
+    uint32_t __t1 = TICKS_READ(); \
+    MEMORY_BARRIER(); \
+    XCYCLE_FROM_CPU(TICKS_DISTANCE(__t0, __t1) - 2); \
 })
 
 #define TIMEIT_WHILE(setup, stmt, cond) ({ \
@@ -107,23 +132,23 @@ static volatile void *PIF_RAM = (void *)0x1fc007c0;
     xcycle_t __total = 0, _min = ~0, _max = 0; \
     for (int __i=0; __i < __n; __i++) { \
         xcycle_t result = TIMEIT(setup, stmt); \
-        if(result < _min) { \
-           if(_min != ~0) { \
-              if(_max != 0) __total += _min; \
-              else _max = _min; \
-           } \
-           _min = result; \
-        } \
-        else if(result > _max) { \
-           if(_max != 0) { \
-              if(_min != ~0) __total += _max; \
-              else _min = _max; \
-           } \
-           _max = result; \
-        } \
-        else __total += result; \
+        if(result < _min) _min = result; \
+        if(result > _max) _max = result; \
+        __total += result; \
     } \
-    __total / (n-2); \
+    (__total - _min - _max) / (n-2); \
+})
+
+#define TIMEIT_MULTI_ODD_DETECTION(n, setup, stmt) ({ \
+    int __n = (n); \
+    xcycle_t __total = 0, _min = ~0, _max = 0; \
+    for (int __i=0; __i < __n; __i++) { \
+        xcycle_t result = TIMEIT_ODD_DETECTION(setup, stmt); \
+        if(result < _min) _min = result; \
+        if(result > _max) _max = result; \
+        __total += result; \
+    } \
+    (__total - _min - _max) / (n-2); \
 })
 
 #define TIMEIT_WHILE_MULTI(n, setup, stmt, cond) ({ \
@@ -131,41 +156,51 @@ static volatile void *PIF_RAM = (void *)0x1fc007c0;
     xcycle_t __total = 0, _min = ~0, _max = 0; \
     for (int __i=0; __i < __n; __i++) { \
         xcycle_t result = TIMEIT_WHILE(setup, stmt, cond); \
-        if(result < _min) { \
-           if(_min != ~0) { \
-              if(_max != 0) __total += _min; \
-              else _max = _min; \
-           } \
-           _min = result; \
-        } \
-        else if(result > _max) { \
-           if(_max != 0) { \
-              if(_min != ~0) __total += _max; \
-              else _min = _max; \
-           } \
-           _max = result; \
-        } \
-        else __total += result; \
+        if(result < _min) _min = result; \
+        if(result > _max) _max = result; \
+        __total += result; \
     } \
-    __total / (n-2); \
+    (__total - _min - _max) / (n-2); \
 })
 
-static inline void fill_out_buffer(void) {
-    uint32_t *__buf = UncachedAddr(rambuf);
-    __buf[0] = 0;
-    __buf[1] = 0;
-    __buf[2] = 0;
-    __buf[3] = 0;
-    __buf[4] = 0;
-    __buf[5] = 0;
+static inline void invalidate_icache_line(const void *addr) {
+   asm volatile ("cache 0x00, 0(%0)" :: "r" (addr));
+}
+
+static inline void invalidate_dcache_line(const void *addr) 
+{
+   asm volatile ("cache 0x11, 0(%0)" :: "r" (addr));
 }
 
 xcycle_t bench_rcp_io_r(benchmark_t *b) {
-    return TIMEIT_MULTI(50, ({ }), ({ (void)VI_regs->control; }));
+   return TIMEIT_MULTI_ODD_DETECTION(50, ({ }), ({ (void)VI_regs->control; }));
 }
 
 xcycle_t bench_rcp_io_w(benchmark_t *b) {
-    return TIMEIT_MULTI(50, fill_out_buffer(), ({ VI_regs->control = 0; }));
+   return TIMEIT_MULTI_ODD_DETECTION(50, ({
+      (void)VI_regs->control;
+   }),
+				     ({
+					VI_regs->control = 0;
+					(void)VI_regs->control;
+				     }));
+}
+
+xcycle_t bench_rcp_io_w_after_r(benchmark_t *b) {
+   debugf("labeladdr:%p", &&mylabel);
+mylabel:
+   return TIMEIT_MULTI_ODD_DETECTION(50, ({
+      VI_regs->control = 0;
+      VI_regs->control = 0;
+      VI_regs->control = 0;
+      VI_regs->control = 0;
+      VI_regs->control = 0;
+      VI_regs->control = 0;
+      (void)PI_regs->status;
+   }),
+				     ({
+					VI_regs->control = 0;
+				     }));
 }
 
 xcycle_t bench_pidma(benchmark_t* b) {
@@ -188,6 +223,20 @@ xcycle_t bench_piiow(benchmark_t* b) {
     volatile uint32_t *ROM = (volatile uint32_t*)0xB0000000;
     return TIMEIT_WHILE_MULTI(50, ({ }), ({ 
         ROM[0] = 0;
+    }), ({  
+        PI_regs->status & (PI_STATUS_DMA_BUSY | PI_STATUS_IO_BUSY);
+    }));
+}
+
+xcycle_t bench_piior_dom2(benchmark_t* b) {
+    volatile uint32_t *DOM2 = (volatile uint32_t*)0xA8000000;
+    return TIMEIT_MULTI(50, ({ }), ({ (void)*DOM2; }));
+}
+
+xcycle_t bench_piiow_dom2(benchmark_t* b) {
+    volatile uint32_t *DOM2 = (volatile uint32_t*)0xA8000000;
+    return TIMEIT_WHILE_MULTI(50, ({ }), ({ 
+        DOM2[0] = 0;
     }), ({  
         PI_regs->status & (PI_STATUS_DMA_BUSY | PI_STATUS_IO_BUSY);
     }));
@@ -229,58 +278,58 @@ xcycle_t bench_siiow(benchmark_t* b) {
 
 xcycle_t bench_ram_cached_r8(benchmark_t *b) {
     volatile uint8_t *RAM = (volatile uint8_t*)(rambuf);
-    return TIMEIT_MULTI(50, ({ (void)*RAM; }), ({ (void)*RAM; }));
+    return TIMEIT_MULTI_ODD_DETECTION(50, ({ (void)*RAM; }), ({ (void)*RAM; }));
 }
 
 xcycle_t bench_ram_cached_r16(benchmark_t *b) {
     volatile uint16_t *RAM = (volatile uint16_t*)(rambuf);
-    return TIMEIT_MULTI(50, ({ (void)*RAM; }), ({ (void)*RAM; }));
+    return TIMEIT_MULTI_ODD_DETECTION(50, ({ (void)*RAM; }), ({ (void)*RAM; }));
 }
 
 xcycle_t bench_ram_cached_r32(benchmark_t *b) {
     volatile uint32_t *RAM = (volatile uint32_t*)(rambuf);
-    return TIMEIT_MULTI(50, ({ (void)*RAM; }), ({ (void)*RAM; }));
+    return TIMEIT_MULTI_ODD_DETECTION(50, ({ (void)*RAM; }), ({ (void)*RAM; }));
 }
 
 xcycle_t bench_ram_cached_r64(benchmark_t *b) {
     volatile uint64_t *RAM = (volatile uint64_t*)(rambuf);
-    return TIMEIT_MULTI(50, ({ (void)*RAM; }), ({ (void)*RAM; }));
+    return TIMEIT_MULTI_ODD_DETECTION(50, ({ (void)*RAM; }), ({ (void)*RAM; }));
 }
 
 xcycle_t bench_ram_uncached_r8(benchmark_t *b) {
     volatile uint8_t *RAM = (volatile uint8_t*)UncachedAddr(rambuf);
-    return TIMEIT_MULTI(50, ({ }), ({ (void)*RAM; }));
+    return TIMEIT_MULTI_ODD_DETECTION(50, ({ }), ({ (void)*RAM; }));
 }
 
 xcycle_t bench_ram_uncached_r16(benchmark_t *b) {
     volatile uint16_t *RAM = (volatile uint16_t*)UncachedAddr(rambuf);
-    return TIMEIT_MULTI(50, ({ }), ({ (void)*RAM; }));
+    return TIMEIT_MULTI_ODD_DETECTION(50, ({ }), ({ (void)*RAM; }));
 }
 
 xcycle_t bench_ram_uncached_r32(benchmark_t *b) {
     volatile uint32_t *RAM = (volatile uint32_t*)UncachedAddr(rambuf);
-    return TIMEIT_MULTI(50, ({ }), ({ (void)*RAM; }));
+    return TIMEIT_MULTI_ODD_DETECTION(50, ({ }), ({ (void)*RAM; }));
 }
 
 xcycle_t bench_ram_uncached_r64(benchmark_t *b) {
-    volatile uint64_t *RAM = (volatile uint64_t*)UncachedAddr(rambuf);
-    return TIMEIT_MULTI(50, ({ }), ({ (void)*RAM; }));
+    volatile uint64_t *RAM = (volatile uint64_t*)/*UncachedAddr(rambuf)*/0xa3f00800;
+    return TIMEIT_MULTI_ODD_DETECTION(50, ({ }), ({ (void)*RAM; }));
 }
 
 xcycle_t bench_ram_uncached_r32_seq(benchmark_t *b) {
-    volatile uint32_t *RAM0 = (volatile uint32_t*)UncachedAddr(rambuf);
-    volatile uint32_t *RAM1 = (volatile uint32_t*)UncachedAddr(rambuf+4);
-    volatile uint32_t *RAM2 = (volatile uint32_t*)UncachedAddr(rambuf+8);
-    volatile uint32_t *RAM3 = (volatile uint32_t*)UncachedAddr(rambuf+12);
-    return TIMEIT_MULTI(50, ({ }), ({ (void)*RAM0; (void)*RAM1; (void)*RAM2; (void)*RAM3; }));
+    volatile uint32_t *RAM0 = (volatile uint32_t*)UncachedAddr(0x80000000);
+    volatile uint32_t *RAM1 = (volatile uint32_t*)UncachedAddr(0x80000000+4);
+    volatile uint32_t *RAM2 = (volatile uint32_t*)UncachedAddr(0x80000000+8);
+    volatile uint32_t *RAM3 = (volatile uint32_t*)UncachedAddr(0x80000000+12);
+    return TIMEIT_MULTI_ODD_DETECTION(50, ({ }), ({ (void)*RAM0; (void)*RAM1; (void)*RAM2; (void)*RAM3; }));
 }
 
 xcycle_t bench_ram_uncached_r32_random(benchmark_t *b) {
-    volatile uint32_t *RAM0 = (volatile uint32_t*)UncachedAddr(rambuf+1024);
-    volatile uint32_t *RAM1 = (volatile uint32_t*)UncachedAddr(rambuf+12);
-    volatile uint32_t *RAM2 = (volatile uint32_t*)UncachedAddr(rambuf+568);
-    volatile uint32_t *RAM3 = (volatile uint32_t*)UncachedAddr(rambuf+912);
-    return TIMEIT_MULTI(50, ({ }), ({ (void)*RAM0; (void)*RAM1; (void)*RAM2; (void)*RAM3; }));
+    volatile uint32_t *RAM0 = (volatile uint32_t*)UncachedAddr(0x80000000+1024);
+    volatile uint32_t *RAM1 = (volatile uint32_t*)UncachedAddr(0x80000000+12);
+    volatile uint32_t *RAM2 = (volatile uint32_t*)UncachedAddr(0x80000000+568);
+    volatile uint32_t *RAM3 = (volatile uint32_t*)UncachedAddr(0x80000000+912);
+    return TIMEIT_MULTI_ODD_DETECTION(50, ({ }), ({ (void)*RAM0; (void)*RAM1; (void)*RAM2; (void)*RAM3; }));
 }
 
 xcycle_t bench_ram_uncached_r32_multibank(benchmark_t *b) {
@@ -288,7 +337,372 @@ xcycle_t bench_ram_uncached_r32_multibank(benchmark_t *b) {
     volatile uint32_t *RAM1 = (volatile uint32_t*)UncachedAddr(0x80100000);
     volatile uint32_t *RAM2 = (volatile uint32_t*)UncachedAddr(0x80200000);
     volatile uint32_t *RAM3 = (volatile uint32_t*)UncachedAddr(0x80300000);
-    return TIMEIT_MULTI(50, ({ }), ({ (void)*RAM0; (void)*RAM1; (void)*RAM2; (void)*RAM3; }));
+    return TIMEIT_MULTI_ODD_DETECTION(50, ({ }), ({ (void)*RAM0; (void)*RAM1; (void)*RAM2; (void)*RAM3; }));
+}
+
+xcycle_t bench_ram_uncached_r32_multirows(benchmark_t *b) {
+    volatile uint32_t *RAM0 = (volatile uint32_t*)UncachedAddr(0x80000000);
+    volatile uint32_t *RAM1 = (volatile uint32_t*)UncachedAddr(0x80000800);
+    volatile uint32_t *RAM2 = (volatile uint32_t*)UncachedAddr(0x80001000);
+    volatile uint32_t *RAM3 = (volatile uint32_t*)UncachedAddr(0x80000800);
+    return TIMEIT_MULTI_ODD_DETECTION(50, ({ }), ({ (void)*RAM0; (void)*RAM1; (void)*RAM2; (void)*RAM3; }));
+}
+
+xcycle_t bench_ram_uncached_r64_seq(benchmark_t *b) {
+    volatile uint64_t *RAM0 = (volatile uint64_t*)UncachedAddr(0x80000000);
+    volatile uint64_t *RAM1 = (volatile uint64_t*)UncachedAddr(0x80000000+8);
+    volatile uint64_t *RAM2 = (volatile uint64_t*)UncachedAddr(0x80000000+16);
+    volatile uint64_t *RAM3 = (volatile uint64_t*)UncachedAddr(0x80000000+24);
+    return TIMEIT_MULTI_ODD_DETECTION(50, ({ }), ({ (void)*RAM0; (void)*RAM1; (void)*RAM2; (void)*RAM3; }));
+}
+
+xcycle_t bench_ram_uncached_r64_random(benchmark_t *b) {
+    volatile uint64_t *RAM0 = (volatile uint64_t*)UncachedAddr(0x80000000+1024);
+    volatile uint64_t *RAM1 = (volatile uint64_t*)UncachedAddr(0x80000000+16);
+    volatile uint64_t *RAM2 = (volatile uint64_t*)UncachedAddr(0x80000000+568);
+    volatile uint64_t *RAM3 = (volatile uint64_t*)UncachedAddr(0x80000000+912);
+    return TIMEIT_MULTI_ODD_DETECTION(50, ({ }), ({ (void)*RAM0; (void)*RAM1; (void)*RAM2; (void)*RAM3; }));
+}
+
+xcycle_t bench_ram_uncached_r64_multibank(benchmark_t *b) {
+    volatile uint64_t *RAM0 = (volatile uint64_t*)UncachedAddr(0x80000000);
+    volatile uint64_t *RAM1 = (volatile uint64_t*)UncachedAddr(0x80100000);
+    volatile uint64_t *RAM2 = (volatile uint64_t*)UncachedAddr(0x80200000);
+    volatile uint64_t *RAM3 = (volatile uint64_t*)UncachedAddr(0x80300000);
+    return TIMEIT_MULTI_ODD_DETECTION(50, ({ }), ({ (void)*RAM0; (void)*RAM1; (void)*RAM2; (void)*RAM3; }));
+}
+
+xcycle_t bench_ram_uncached_r64_multirows(benchmark_t *b) {
+    volatile uint64_t *RAM0 = (volatile uint64_t*)UncachedAddr(0x80000000);
+    volatile uint64_t *RAM1 = (volatile uint64_t*)UncachedAddr(0x80000800);
+    volatile uint64_t *RAM2 = (volatile uint64_t*)UncachedAddr(0x80001000);
+    volatile uint64_t *RAM3 = (volatile uint64_t*)UncachedAddr(0x80000800);
+    return TIMEIT_MULTI_ODD_DETECTION(50, ({ }), ({ (void)*RAM0; (void)*RAM1; (void)*RAM2; (void)*RAM3; }));
+}
+
+xcycle_t bench_ram_uncached_w32(benchmark_t *b)  {
+   volatile uint32_t* RAMBUF = (volatile uint32_t*)UncachedAddr(rambuf);
+   return TIMEIT_MULTI_ODD_DETECTION(50,
+				     ({ (void)*RAMBUF; }),
+				     ({ *RAMBUF = 1; (void)*RAMBUF; }));
+}
+
+xcycle_t bench_ram_uncached_w32_bank(benchmark_t *b) {
+   volatile uint32_t* RAMBUF = (volatile uint32_t*)UncachedAddr(rambuf);
+   volatile uint32_t* RAMBUF_BANK2 = (volatile uint32_t*)UncachedAddr(rambuf + 0x100000);
+   return TIMEIT_MULTI_ODD_DETECTION(50,
+				     ({ (void)*RAMBUF; }),
+				     ({ *RAMBUF_BANK2 = 1; (void)*RAMBUF; }));
+}
+
+xcycle_t bench_ram_uncached_w32_row(benchmark_t *b) {
+   volatile uint32_t* RAMBUF = (volatile uint32_t*)UncachedAddr(rambuf);
+   volatile uint32_t* RAMBUF_ROW2 = (volatile uint32_t*)UncachedAddr(rambuf + 0x800);
+   return TIMEIT_MULTI_ODD_DETECTION(50,
+				     ({ (void)*RAMBUF; }),
+				     ({ *RAMBUF_ROW2 = 1; (void)*RAMBUF; }));
+}
+
+xcycle_t bench_icache_fill_page_hit(benchmark_t *b)  {
+   uintptr_t page_base = (((uintptr_t)rambuf + 0x800) & ~0x7FF) + 0x1000;
+
+   volatile uint32_t *payload_uc = (volatile uint32_t *)UncachedAddr(page_base);
+   for(int i = 0; i < 6; i++) payload_uc[i] = 0x00000000; // nop
+   payload_uc[6] = 0x03e00008; // jr ra
+   payload_uc[7] = 0x00000000; // nop (branch delay slot)
+     
+   void (*target_func)(void) = (void (*)(void))(page_base | 0x80000000);
+
+   volatile uint32_t *same_page_uc = (volatile uint32_t *)UncachedAddr(page_base + 0x20);
+   
+   target_func();
+   
+   return TIMEIT_MULTI(50,
+		       ({
+			  invalidate_icache_line((void*)target_func);
+			  (void)*same_page_uc;
+			  asm volatile("nop; nop; nop; nop;");
+		       }
+		       ),
+		       ({
+			  target_func();
+		       }
+		       ));
+}
+
+xcycle_t bench_icache_fill_page_miss(benchmark_t *b)  {
+   uintptr_t page_base = (((uintptr_t)rambuf + 0x800) & ~0x7FF) + 0x1000;
+   
+   volatile uint32_t *payload_uc = (volatile uint32_t *)UncachedAddr(page_base);
+   for(int i = 0; i < 6; i++) payload_uc[i] = 0x00000000; // nop
+   payload_uc[6] = 0x03e00008; // jr ra
+   payload_uc[7] = 0x00000000; // nop (branch delay slot)
+   
+   void (*target_func)(void) = (void (*)(void))(page_base | 0x80000000);
+   
+   volatile uint32_t *diff_page_uc = (volatile uint32_t *)UncachedAddr(page_base + 0x800);
+   
+   target_func();
+   
+   return TIMEIT_MULTI(50,
+		       ({
+			  invalidate_icache_line((void*)target_func);
+			  (void)*diff_page_uc;
+			  asm volatile("nop; nop; nop; nop;");
+		       }
+		       ),
+		       ({
+			  target_func();
+		       }
+		       ));
+}
+
+xcycle_t bench_icache_fill_begin_page_hit(benchmark_t *b)  {
+   uintptr_t page_base = (((uintptr_t)rambuf + 0x800) & ~0x7FF) + 0x1000;
+
+   volatile uint32_t *payload_uc = (volatile uint32_t *)UncachedAddr(page_base);
+   payload_uc[0] = 0x03e00008; // jr ra
+   payload_uc[1] = 0x00000000; // nop (branch delay slot)
+     
+   void (*target_func)(void) = (void (*)(void))(page_base | 0x80000000);
+
+   volatile uint32_t *same_page_uc = (volatile uint32_t *)UncachedAddr(page_base + 0x20);
+   
+   target_func();
+   
+   return TIMEIT_MULTI(50,
+		       ({
+			  invalidate_icache_line((void*)target_func);
+			  (void)*same_page_uc;
+			  asm volatile("nop; nop; nop; nop;");
+		       }
+		       ),
+		       ({
+			  target_func();
+		       }
+		       ));
+}
+
+xcycle_t bench_icache_fill_begin_page_miss(benchmark_t *b)  {
+   uintptr_t page_base = (((uintptr_t)rambuf + 0x800) & ~0x7FF) + 0x1000;
+   
+   volatile uint32_t *payload_uc = (volatile uint32_t *)UncachedAddr(page_base);
+   payload_uc[0] = 0x03e00008; // jr ra
+   payload_uc[1] = 0x00000000; // nop (branch delay slot)
+   
+   void (*target_func)(void) = (void (*)(void))(page_base | 0x80000000);
+   
+   volatile uint32_t *diff_page_uc = (volatile uint32_t *)UncachedAddr(page_base + 0x800);
+   
+   target_func();
+   
+   return TIMEIT_MULTI(50,
+		       ({
+			  invalidate_icache_line((void*)target_func);
+			  (void)*diff_page_uc;
+			  asm volatile("nop; nop; nop; nop;");
+		       }
+		       ),
+		       ({
+			  target_func();
+		       }
+		       ));
+}
+
+xcycle_t bench_dcache_cwf_base(benchmark_t *b) 
+{
+   uint32_t *target = (uint32_t *)((((uintptr_t)rambuf + 0x800) & ~0xF) | 0x80000000);
+   
+   return TIMEIT_MULTI(50,
+		       ({
+			  invalidate_dcache_line(target);
+			  asm volatile("nop; nop; nop; nop;");
+		       }
+		       ),
+		       ({
+			  asm volatile("lw $t0, 0(%0)" :: "r" (target) : "t0");
+		       }
+		       ));
+}
+
+xcycle_t bench_dcache_cwf_word1(benchmark_t *b) 
+{
+   uint32_t *target = (uint32_t *)((((uintptr_t)rambuf + 0x800) & ~0xF) | 0x80000000);
+   
+   return TIMEIT_MULTI(50,
+		       ({
+			  invalidate_dcache_line(target);
+			  asm volatile("nop; nop; nop; nop:");
+		       }
+		       ),
+		       ({
+			  asm volatile(
+				       "lw $t0, 0(%0)\n"
+				       "lw $t1, 4(%0)\n"
+				       :: "r" (target) : "t0", "t1"
+				      );
+		       }
+		       ));
+}
+
+
+xcycle_t bench_dcache_cwf_word2(benchmark_t *b) 
+{
+   uint32_t *target = (uint32_t *)((((uintptr_t)rambuf + 0x800) & ~0xF) | 0x80000000);
+   
+   return TIMEIT_MULTI(50,
+		       ({
+			  invalidate_dcache_line(target);
+			  asm volatile("nop; nop; nop; nop;");
+		       }
+		       ),
+		       ({
+			  asm volatile(
+				       "lw $t0, 0(%0)\n"
+				       "lw $t1, 8(%0)\n"
+				       :: "r" (target) : "t0", "t1"
+				      );
+		       }
+		       ));
+}
+
+
+xcycle_t bench_dcache_cwf_word3(benchmark_t *b) 
+{
+   uint32_t *target = (uint32_t *)((((uintptr_t)rambuf + 0x800) & ~0xF) | 0x80000000);
+   
+   return TIMEIT_MULTI(50,
+		       ({
+			  invalidate_dcache_line(target);
+			  asm volatile("nop; nop; nop; nop;");
+		       }
+		       ),
+		       ({
+			  asm volatile(
+				       "lw $t0, 0(%0)\n"
+				       "lw $t1, 12(%0)\n"
+				       :: "r" (target) : "t0", "t1"
+				      );
+		       }
+		       ));
+}
+
+xcycle_t bench_dcache_cwf_row(benchmark_t *b) 
+{
+   uintptr_t page_base = (((uintptr_t)rambuf + 0x800) & ~0x7FF) + 0x1000;
+   
+   uint32_t *target = (uint32_t *)(page_base | 0x80000000);
+   
+   volatile uint32_t *diff_page_uc = (volatile uint32_t *)UncachedAddr(page_base + 0x2000);
+   
+   return TIMEIT_MULTI(50,
+		       ({
+			  invalidate_dcache_line(target);
+			  (void)*diff_page_uc;
+			  asm volatile("nop; nop; nop; nop;");
+		       }
+		       ),
+		       ({
+			  asm volatile("lw $t0, 0(%0)" :: "r" (target) : "t0");
+		       }
+		       ));
+}
+
+xcycle_t bench_dcache_miss_write_sw(benchmark_t *b) 
+{
+   uint32_t *target = (uint32_t *)((((uintptr_t)rambuf + 0x800) & ~0xF) | 0x80000000);
+   
+   return TIMEIT_MULTI(50,
+		       ({
+			  invalidate_dcache_line(target);
+			  asm volatile("nop; nop; nop; nop;");
+		       }
+		       ),
+		       ({
+			  asm volatile("sw $zero, 0(%0)" :: "r" (target));
+		       }
+		       ));
+}
+
+xcycle_t bench_dcache_miss_write_sb(benchmark_t *b) 
+{
+   uint32_t *target = (uint32_t *)((((uintptr_t)rambuf + 0x800) & ~0xF) | 0x80000000);
+   
+   return TIMEIT_MULTI(50,
+		       ({
+			  invalidate_dcache_line(target);
+			  asm volatile("nop; nop; nop; nop;");
+		       }
+		       ),
+		       ({
+			  asm volatile("sb $zero, 0(%0)" :: "r" (target));
+		       }
+		       ));
+}
+
+xcycle_t bench_dcache_miss_write_sw_lw(benchmark_t *b) 
+{
+   uint32_t *target = (uint32_t *)((((uintptr_t)rambuf + 0x800) & ~0xF) | 0x80000000);
+
+   return TIMEIT_MULTI(50,
+		       ({
+			  invalidate_dcache_line(target);
+			  asm volatile("nop; nop; nop; nop;");
+		       }
+		       ),
+		       ({
+			  asm volatile(
+				       "sw $zero, 0(%0)\n"
+				       "lw $t0, 4(%0)\n"
+				       :: "r" (target) : "t0"
+				      );
+		       }
+		       ));
+}
+
+xcycle_t bench_dcache_miss_write_sw_sw(benchmark_t *b) 
+{
+   uint32_t *target = (uint32_t *)((((uintptr_t)rambuf + 0x800) & ~0xF) | 0x80000000);
+   
+   return TIMEIT_MULTI(50,
+		       ({
+			  invalidate_dcache_line(target);
+			  asm volatile("nop; nop; nop; nop;");
+		       }
+		       ),
+		       ({
+			  asm volatile(
+				       "sw $zero, 0(%0)\n"
+				       "sw $zero, 4(%0)\n"
+				       :: "r" (target)
+				      );
+		       }
+		       ));
+}
+
+
+xcycle_t bench_sp_io_dmem_r(benchmark_t *b) {
+    return TIMEIT_MULTI_ODD_DETECTION(50, ({ }), ({ (void)*(volatile uint32_t*)DMEM; }));
+}
+
+xcycle_t bench_sp_io_dmem_w(benchmark_t *b) {
+    return TIMEIT_MULTI_ODD_DETECTION(50, ({ (void)*(volatile uint32_t*)DMEM; }),
+				      ({
+					 *(volatile uint32_t*)DMEM = 5;
+					 (void)*(volatile uint32_t*)DMEM;
+				      }));
+}
+
+xcycle_t bench_sp_io_imem_r(benchmark_t *b) {
+    return TIMEIT_MULTI_ODD_DETECTION(50, ({ }), ({ (void)*(volatile uint32_t*)IMEM; }));
+}
+
+xcycle_t bench_sp_io_imem_w(benchmark_t *b) {
+    return TIMEIT_MULTI_ODD_DETECTION(50, ({ (void)*(volatile uint32_t*)IMEM; }),
+				      ({
+					 *(volatile uint32_t*)IMEM = 5;
+					 (void)*(volatile uint32_t*)IMEM;
+				      }));
 }
 
 static void joybus_write(uint64_t *in) {
@@ -302,6 +716,11 @@ static void joybus_read(uint64_t *out) {
     SI_regs->DRAM_addr = out;
     SI_regs->PIF_addr_read = PIF_RAM;
     while (SI_regs->status & (SI_STATUS_DMA_BUSY | SI_STATUS_IO_BUSY)) {}
+}
+
+static void joybus_wait(void)
+{
+   while (SI_regs->status & (SI_STATUS_DMA_BUSY | SI_STATUS_IO_BUSY)) {}
 }
 
 xcycle_t bench_joybus_empty0(benchmark_t *b) {
@@ -321,6 +740,26 @@ xcycle_t bench_joybus_empty0(benchmark_t *b) {
     }), ({ joybus_read(out); }));
 }
 
+xcycle_t bench_joybus_wempty0(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+
+    return TIMEIT_MULTI(50,
+			({
+			   joybus_wait();
+			}),
+			({ 
+			   buf[0] = 0xfe00000000000000;
+			   buf[1] = 0;
+			   buf[2] = 0;
+			   buf[3] = 0;
+			   buf[4] = 0;
+			   buf[5] = 0;
+			   buf[6] = 0;
+			   buf[7] = 1;       
+			   joybus_write(buf); 
+			}));
+}
+
 xcycle_t bench_joybus_empty0b(benchmark_t *b) {
     uint64_t *buf = UncachedAddr(rambuf);
     uint64_t *out = UncachedAddr(rambuf+64);
@@ -336,6 +775,26 @@ xcycle_t bench_joybus_empty0b(benchmark_t *b) {
         buf[7] = 1;       
         joybus_write(buf); 
     }), ({ joybus_read(out); }));
+}
+
+xcycle_t bench_joybus_wempty0b(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+
+    return TIMEIT_MULTI(50,
+			({
+			   joybus_wait();
+			}),
+			({ 
+			   buf[0] = 0x00fe000000000000;
+			   buf[1] = 0;
+			   buf[2] = 0;
+			   buf[3] = 0;
+			   buf[4] = 0;
+			   buf[5] = 0;
+			   buf[6] = 0;
+			   buf[7] = 1;       
+			   joybus_write(buf); 
+			}));
 }
 
 xcycle_t bench_joybus_empty0c(benchmark_t *b) {
@@ -355,6 +814,26 @@ xcycle_t bench_joybus_empty0c(benchmark_t *b) {
     }), ({ joybus_read(out); }));
 }
 
+xcycle_t bench_joybus_wempty0c(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+
+    return TIMEIT_MULTI(50,
+			({
+			   joybus_wait();
+			}),
+			({ 
+			   buf[0] = 0x00000000fe000000;
+			   buf[1] = 0;
+			   buf[2] = 0;
+			   buf[3] = 0;
+			   buf[4] = 0;
+			   buf[5] = 0;
+			   buf[6] = 0;
+			   buf[7] = 1;       
+			   joybus_write(buf); 
+			}));
+}
+
 xcycle_t bench_joybus_empty1(benchmark_t *b) {
     uint64_t *buf = UncachedAddr(rambuf);
     uint64_t *out = UncachedAddr(rambuf+64);
@@ -370,6 +849,26 @@ xcycle_t bench_joybus_empty1(benchmark_t *b) {
         buf[7] = 1;       
         joybus_write(buf); 
     }), ({ joybus_read(out); }));
+}
+
+xcycle_t bench_joybus_wempty1(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+
+    return TIMEIT_MULTI(50,
+			({
+			   joybus_wait();
+			}),
+			({ 
+			   buf[0] = 0;
+			   buf[1] = 0xfe00000000000000;
+			   buf[2] = 0;
+			   buf[3] = 0;
+			   buf[4] = 0;
+			   buf[5] = 0;
+			   buf[6] = 0;
+			   buf[7] = 1;       
+			   joybus_write(buf); 
+			}));
 }
 
 
@@ -390,6 +889,26 @@ xcycle_t bench_joybus_empty4(benchmark_t *b) {
     }), ({ joybus_read(out); }));
 }
 
+xcycle_t bench_joybus_wempty4(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+
+    return TIMEIT_MULTI(50,
+			({
+			   joybus_wait();
+			}),
+			({ 
+			   buf[0] = 0;
+			   buf[1] = 0;
+			   buf[2] = 0;
+			   buf[3] = 0;
+			   buf[4] = 0xfe00000000000000;
+			   buf[5] = 0;
+			   buf[6] = 0;
+			   buf[7] = 1;
+			   joybus_write(buf); 
+			}));
+}
+
 xcycle_t bench_joybus_empty7(benchmark_t *b) {
     uint64_t *buf = UncachedAddr(rambuf);
     uint64_t *out = UncachedAddr(rambuf+64);
@@ -405,6 +924,26 @@ xcycle_t bench_joybus_empty7(benchmark_t *b) {
         buf[7] = 0xfe00000000000001;       
         joybus_write(buf); 
     }), ({ joybus_read(out); }));
+}
+
+xcycle_t bench_joybus_wempty7(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+
+    return TIMEIT_MULTI(50,
+			({
+			   joybus_wait();
+			}),
+			({ 
+			   buf[0] = 0;
+			   buf[1] = 0;
+			   buf[2] = 0;
+			   buf[3] = 0;
+			   buf[4] = 0;
+			   buf[5] = 0;
+			   buf[6] = 0;
+			   buf[7] = 0xfe00000000000001;       
+			   joybus_write(buf); 
+			}));
 }
 
 xcycle_t bench_joybus_empty7e(benchmark_t *b) {
@@ -424,6 +963,26 @@ xcycle_t bench_joybus_empty7e(benchmark_t *b) {
     }), ({ joybus_read(out); }));
 }
 
+xcycle_t bench_joybus_wempty7e(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+
+    return TIMEIT_MULTI(50,
+			({
+			   joybus_wait();
+			}),
+			({ 
+			   buf[0] = 0;
+			   buf[1] = 0;
+			   buf[2] = 0;
+			   buf[3] = 0;
+			   buf[4] = 0;
+			   buf[5] = 0;
+			   buf[6] = 0;
+			   buf[7] = 0x000000000000fe01;       
+			   joybus_write(buf); 
+			}));
+}
+
 xcycle_t bench_joybus_1j(benchmark_t *b) {
     uint64_t *buf = UncachedAddr(rambuf);
     uint64_t *out = UncachedAddr(rambuf+64);
@@ -439,6 +998,26 @@ xcycle_t bench_joybus_1j(benchmark_t *b) {
         buf[7] = 1;       
         joybus_write(buf); 
     }), ({ joybus_read(out); }));
+}
+
+xcycle_t bench_joybus_w1j(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+
+    return TIMEIT_MULTI(50,
+			({
+			   joybus_wait();
+			}),
+			({ 
+			   buf[0] = 0xff010401ffffffff;
+			   buf[1] = 0xfe00000000000000;
+			   buf[2] = 0;
+			   buf[3] = 0;
+			   buf[4] = 0;
+			   buf[5] = 0;
+			   buf[6] = 0;
+			   buf[7] = 1;       
+			   joybus_write(buf); 
+			}));
 }
 
 xcycle_t bench_joybus_2j(benchmark_t *b) {
@@ -458,6 +1037,26 @@ xcycle_t bench_joybus_2j(benchmark_t *b) {
     }), ({ joybus_read(out); }));
 }
 
+xcycle_t bench_joybus_w2j(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+
+    return TIMEIT_MULTI(50,
+			({
+			   joybus_wait();
+			}),
+			({ 
+			   buf[0] = 0xff010401ffffffff;
+			   buf[1] = 0xff010401ffffffff;
+			   buf[2] = 0xfe00000000000000;
+			   buf[3] = 0;
+			   buf[4] = 0;
+			   buf[5] = 0;
+			   buf[6] = 0;
+			   buf[7] = 1;       
+			   joybus_write(buf); 
+			}));
+}
+
 xcycle_t bench_joybus_3j(benchmark_t *b) {
     uint64_t *buf = UncachedAddr(rambuf);
     uint64_t *out = UncachedAddr(rambuf+64);
@@ -473,6 +1072,46 @@ xcycle_t bench_joybus_3j(benchmark_t *b) {
         buf[7] = 1;       
         joybus_write(buf); 
     }), ({ joybus_read(out); }));
+}
+
+xcycle_t bench_joybus_w3j(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+
+    return TIMEIT_MULTI(50,
+			({
+			   joybus_wait();
+			}),
+			({ 
+			   buf[0] = 0xff010401ffffffff;
+			   buf[1] = 0xff010401ffffffff;
+			   buf[2] = 0xff010401ffffffff;
+			   buf[3] = 0xfe00000000000000;
+			   buf[4] = 0;
+			   buf[5] = 0;
+			   buf[6] = 0;
+			   buf[7] = 1;       
+			   joybus_write(buf); 
+			}));
+}
+
+xcycle_t bench_joybus_w4j(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+
+    return TIMEIT_MULTI(50,
+			({
+			   joybus_wait();
+			}),
+			({ 
+			   buf[0] = 0xff010401ffffffff;
+			   buf[1] = 0xff010401ffffffff;
+			   buf[2] = 0xff010401ffffffff;
+			   buf[3] = 0xff010401ffffffff;
+			   buf[4] = 0xfe00000000000000;
+			   buf[5] = 0;
+			   buf[6] = 0;
+			   buf[7] = 1;       
+			   joybus_write(buf); 
+			}));
 }
 
 xcycle_t bench_joybus_4j(benchmark_t *b) {
@@ -507,6 +1146,292 @@ xcycle_t bench_joybus_access(benchmark_t *b) {
         buf[7] = 1;       
         joybus_write(buf); 
     }), ({ joybus_read(out); }));
+}
+
+xcycle_t bench_joybus_waccess(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+
+    return TIMEIT_MULTI(50,
+			({
+			   joybus_wait();
+			}),
+			({ 
+			   buf[0] = 0xff010300ffffffff;
+			   buf[1] = 0xfe00000000000000;
+			   buf[2] = 0;
+			   buf[3] = 0;
+			   buf[4] = 0;
+			   buf[5] = 0;
+			   buf[6] = 0;
+			   buf[7] = 1;       
+			   joybus_write(buf); 
+			}));
+}
+
+xcycle_t bench_joybus_access_read(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+    uint64_t *out = UncachedAddr(rambuf+64);
+
+    return TIMEIT_MULTI(50, ({ 
+        buf[0] = 0xff0321020035ffff;
+        buf[1] = 0xffffffffffffffff;
+        buf[2] = 0xffffffffffffffff;
+        buf[3] = 0xffffffffffffffff;
+        buf[4] = 0xfffffffffffffffe;
+        buf[5] = 0;
+        buf[6] = 0;
+        buf[7] = 1;       
+        joybus_write(buf); 
+    }), ({ joybus_read(out); }));
+}
+
+xcycle_t bench_joybus_waccess_read(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+
+    return TIMEIT_MULTI(50,
+			({
+			   joybus_wait();
+			}),
+			({ 
+			   buf[0] = 0xff0321020035ffff;
+			   buf[1] = 0xffffffffffffffff;
+			   buf[2] = 0xffffffffffffffff;
+			   buf[3] = 0xffffffffffffffff;
+			   buf[4] = 0xfffffffffffffffe;
+			   buf[5] = 0;
+			   buf[6] = 0;
+			   buf[7] = 1;       
+			   joybus_write(buf); 
+			}));
+}
+
+xcycle_t bench_joybus_access_write(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+    uint64_t *out = UncachedAddr(rambuf+64);
+
+    return TIMEIT_MULTI(50, ({ 
+        buf[0] = 0xff23010300350102;
+        buf[1] = 0x030405060708090a;
+        buf[2] = 0x0b0c0d0e0f101112;
+        buf[3] = 0x131415161718191a;
+        buf[4] = 0x1b1c1d1e1f20fffe;
+        buf[5] = 0;
+        buf[6] = 0;
+        buf[7] = 1;       
+        joybus_write(buf); 
+    }), ({ joybus_read(out); }));
+}
+
+xcycle_t bench_joybus_waccess_write(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+
+    return TIMEIT_MULTI(50,
+			({
+			   joybus_wait();
+			}),
+			({
+			   buf[0] = 0x2301030035010203;
+			   buf[1] = 0x0405060708090a0b;
+			   buf[2] = 0x0c0d0e0f10111213;
+			   buf[3] = 0x1415161718191a1b;
+			   buf[4] = 0x1c1d1e1f20fffe00;
+			   buf[5] = 0;
+			   buf[6] = 0;
+			   buf[7] = 1;       
+			   joybus_write(buf); 
+			}));
+}
+
+xcycle_t bench_6105r(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+    uint64_t *out = UncachedAddr(rambuf+64);
+
+    xcycle_t res = TIMEIT_MULTI(50, ({ 
+        buf[0] = 0xffffffffffffffff;
+        buf[1] = 0xffffffffffffffff;
+        buf[2] = 0xffffffffffffffff;
+        buf[3] = 0xffffffffffffffff;
+        buf[4] = 0xffffffffffffffff;
+        buf[5] = 0xffffffffffffffff;
+        buf[6] = 0x0102030405060708;
+        buf[7] = 0xa1b2c3d4e5f67702;
+        joybus_write(buf); 
+    }), ({ joybus_read(out); }));
+   
+   return res;
+}
+
+xcycle_t bench_6105w(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+
+    xcycle_t res = TIMEIT_MULTI(50,
+			({
+			   joybus_wait();
+			}),
+			({ 
+			   buf[0] = 0xffffffffffffffff;
+			   buf[1] = 0xffffffffffffffff;
+			   buf[2] = 0xffffffffffffffff;
+			   buf[3] = 0xffffffffffffffff;
+			   buf[4] = 0xffffffffffffffff;
+			   buf[5] = 0xffffffffffffffff;
+			   buf[6] = 0x0102030405060708;
+			   buf[7] = 0xa1b2c3d4e5f67702;       
+			   joybus_write(buf); 
+			}));
+
+   return res;
+}
+
+xcycle_t bench_eeprom_r_parse(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+
+    xcycle_t res = TIMEIT_MULTI(50,
+			({
+			   joybus_wait();
+			}),
+			({ 
+			   buf[0] = 0x0000000002080420;
+			   buf[1] = 0xffffffffffffffff;
+			   buf[2] = 0xffffffffffffffff;
+			   buf[3] = 0xffffffffffffffff;
+			   buf[4] = 0xffffffffffffffff;
+			   buf[5] = 0xffffffffffffffff;
+			   buf[6] = 0xffffffffffffffff;
+			   buf[7] = 0xffffffffffffff01;
+			   joybus_write(buf);
+			}));
+
+   return res;
+}
+
+xcycle_t bench_eeprom_r_exe(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+    uint64_t *out = UncachedAddr(rambuf+64);
+
+    xcycle_t res = TIMEIT_MULTI(50, ({ 
+       buf[0] = 0x0000000002080420;
+       buf[1] = 0xffffffffffffffff;
+       buf[2] = 0xffffffffffffffff;
+       buf[3] = 0xffffffffffffffff;
+       buf[4] = 0xffffffffffffffff;
+       buf[5] = 0xffffffffffffffff;
+       buf[6] = 0xffffffffffffffff;
+       buf[7] = 0xffffffffffffff01;
+       joybus_write(buf);
+        joybus_write(buf); 
+    }), ({ joybus_read(out); }));
+   
+   return res;
+}
+
+xcycle_t bench_eeprom_w_parse(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+
+    xcycle_t res = TIMEIT_MULTI(50,
+			({
+			   joybus_wait();
+			}),
+			({ 
+			   buf[0] = 0x0000000009010520;
+			   buf[1] = 0x0102030405060708;
+			   buf[2] = 0xffffffffffffffff;
+			   buf[3] = 0xffffffffffffffff;
+			   buf[4] = 0xffffffffffffffff;
+			   buf[5] = 0xffffffffffffffff;
+			   buf[6] = 0xffffffffffffffff;
+			   buf[7] = 0xffffffffffffff01;
+			   joybus_write(buf);
+			}));
+
+   return res;
+}
+
+xcycle_t bench_eeprom_w_exe(benchmark_t *b) {
+    uint64_t *buf = UncachedAddr(rambuf);
+    uint64_t *out = UncachedAddr(rambuf+64);
+
+    xcycle_t res = TIMEIT_MULTI(50, ({ 
+       buf[0] = 0x0000000009010520;
+       buf[1] = 0x0102030405060708;
+       buf[2] = 0xffffffffffffffff;
+       buf[3] = 0xffffffffffffffff;
+       buf[4] = 0xffffffffffffffff;
+       buf[5] = 0xffffffffffffffff;
+       buf[6] = 0xffffffffffffffff;
+       buf[7] = 0xffffffffffffff01;
+       joybus_write(buf);
+        joybus_write(buf); 
+    }), ({ joybus_read(out); }));
+   
+   return res;
+}
+
+#define  BUILD_SP_LEN_REG(count, length, skip) ((((count-1) & 0xFF) << 12) | ((length-1) & 0xFF8) | ((skip & 0xFF8) << 20))
+
+xcycle_t bench_spdma_read(benchmark_t* b) {
+   return TIMEIT_WHILE_MULTI(10, ({
+      SP_regs->DRAM_addr = rambuf;
+      SP_regs->RSP_addr = 0;
+   }), ({
+      SP_regs->rsp_read_length = b->qty;
+   }), ({
+      SP_regs->status & (SP_STATUS_DMA_BUSY | SP_STATUS_IO_BUSY);
+   }));
+}
+
+xcycle_t bench_spdma_write(benchmark_t* b) {
+   return TIMEIT_WHILE_MULTI(10, ({
+      SP_regs->DRAM_addr = rambuf;
+      SP_regs->RSP_addr = 0;
+   }), ({
+      SP_regs->rsp_write_length = b->qty;
+   }), ({
+      SP_regs->status & (SP_STATUS_DMA_BUSY | SP_STATUS_IO_BUSY);
+   }));
+}
+
+xcycle_t bench_rdp_fillrect(benchmark_t* b) {
+   uint64_t* currentPointer;
+   
+   return TIMEIT_WHILE_MULTI(10, ({
+      OtherModes other_modes = { 0 };
+      
+      *DP_STATUS = DP_WSTATUS_SET_XBUS_DMEM_DMA;
+      currentPointer = (uint64_t*)DMEM;
+      rdp_asm_set_color_image(&currentPointer, FORMAT_RGBA, PIXELSIZE_16BPP, 320, rambuf);
+      rdp_asm_set_scissor(&currentPointer, (Point){0.0, 0.0}, (Point){320.0, 240.0}, INTERLACED_MODE_OFF, FIELD_EVEN);
+      rdp_asm_set_cycle_type(&other_modes, CYCLE_TYPE_FILL);
+      rdp_asm_set_other_modes(&currentPointer, other_modes);
+      rdp_asm_set_fill_color(&currentPointer, (Color){ .rgba16 = { { .value = toRGBA16(128, 0, 0, 0), .value = toRGBA16(128, 0, 0, 0) }}});
+      rdp_asm_sync_full(&currentPointer);
+
+      *MI_MODE = MI_WMODE_CLR_DPINT;
+      *DP_START = 0;
+      *DP_END = (int32_t)currentPointer & 0xFFF;
+      while((*DP_STATUS & DP_STATUS_PIPE_BUSY) != 0 || (*MI_INTERRUPT & MI_INTERRUPT_DP) == 0);
+      
+      currentPointer = (uint64_t*)DMEM;
+      rdp_asm_fill_rectangle(&currentPointer, (Point){0.0, 0.0}, (Point){(float)b->qty, (float)b->qty});
+      rdp_asm_sync_full(&currentPointer);
+      *MI_MODE = MI_WMODE_CLR_DPINT;
+      *DP_START = 0;
+   }), ({
+      *DP_END = (int32_t)currentPointer & 0XFFF;
+   }), ({
+      (*DP_STATUS & DP_STATUS_PIPE_BUSY) != 0 ||
+      (*MI_INTERRUPT & MI_INTERRUPT_DP) == 0;
+   }));
+}
+
+xcycle_t bench_flashram_erase_chip(benchmark_t* b) {
+   return TIMEIT_WHILE_MULTI(10, ({
+      *((volatile int*)0xa8010000) = 0x3c000000;
+   }), ({
+      *((volatile int*)0xa8010000) = 0x78000000;
+   }), ({
+      (*((volatile int*)0xa8000000) & 0x80) == 0;
+   }));
 }
 
 /**************************************************************************************/
@@ -569,22 +1494,50 @@ void format_speed(char *buf, int nbytes, xcycle_t time) {
 int main(void)
 {
     benchmark_t benchs[] = {
-        { bench_ram_cached_r8,  "RDRAM C8R",     1,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(3) },
-        { bench_ram_cached_r16, "RDRAM C16R",    2,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(3) },
-        { bench_ram_cached_r32, "RDRAM C32R",    4,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(3) },
-        { bench_ram_cached_r64, "RDRAM C64R",    8,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(3) },
+        { bench_ram_cached_r8,  "RDRAM C8R",     1,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(2) },
+        { bench_ram_cached_r16, "RDRAM C16R",    2,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(2) },
+        { bench_ram_cached_r32, "RDRAM C32R",    4,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(2) },
+        { bench_ram_cached_r64, "RDRAM C64R",    8,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(2) },
 
         { bench_ram_uncached_r8,  "RDRAM U8R",     1,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(34) },
         { bench_ram_uncached_r16, "RDRAM U16R",    2,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(34) },
         { bench_ram_uncached_r32, "RDRAM U32R",    4,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(34) },
-        { bench_ram_uncached_r64, "RDRAM U64R",    8,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(37) },
+        { bench_ram_uncached_r64, "RDRAM U64R",    8,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(35) },
 
         { bench_ram_uncached_r32_seq,       "RDRAM U32R seq",    4*4,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(134) },
         { bench_ram_uncached_r32_random,    "RDRAM U32R rand",   4*4,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(134) },
-        { bench_ram_uncached_r32_multibank, "RDRAM U32R banked", 4*4,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(136) },
+        { bench_ram_uncached_r32_multibank, "RDRAM U32R banked", 4*4,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(135) },
+        { bench_ram_uncached_r32_multirows, "RDRAM U32R rows",   4*4,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(167) },
 
-        { bench_rcp_io_r, "RCP I/O R",    1,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(24) },
-        // { bench_rcp_io_w, "RCP I/O W",   1,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(193) },  // FIXME: flush buffer
+        { bench_ram_uncached_r64_seq,       "RDRAM U64R seq",    4*8,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(144) },
+        { bench_ram_uncached_r64_random,    "RDRAM U64R rand",   4*8,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(144) },
+        { bench_ram_uncached_r64_multibank, "RDRAM U64R banked", 4*8,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(145) },
+        { bench_ram_uncached_r64_multirows, "RDRAM U64R rows",   4*8,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(170) },
+
+        { bench_ram_uncached_w32,     "RDRAM U32W",         4,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(46) },
+        { bench_ram_uncached_w32_bank,"RDRAM U32W sw bank", 4,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(46) },
+        { bench_ram_uncached_w32_row, "RDRAM U32W sw row",  4,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(64) },
+
+        { bench_icache_fill_page_hit,        "ICACHE Fill (Hit)", 32, UNIT_BYTES, CYCLE_CPU, XCYCLE_FROM_CPU(54) },
+        { bench_icache_fill_page_miss,       "ICACHE Fill (Miss)", 32, UNIT_BYTES, CYCLE_CPU, XCYCLE_FROM_CPU(61) },
+        { bench_icache_fill_begin_page_hit,  "ICACHE Begin (Hit)", 32, UNIT_BYTES, CYCLE_CPU, XCYCLE_FROM_CPU(49) },
+        { bench_icache_fill_begin_page_miss, "ICACHE Begin (Miss)", 32, UNIT_BYTES, CYCLE_CPU, XCYCLE_FROM_CPU(54) },
+
+        { bench_dcache_cwf_base,  "DCACHE Miss (W0)",     4, UNIT_BYTES, CYCLE_CPU, XCYCLE_FROM_CPU(35) },
+        { bench_dcache_cwf_word1, "DCACHE Miss (W0,W1)",  8, UNIT_BYTES, CYCLE_CPU, XCYCLE_FROM_CPU(40) },
+        { bench_dcache_cwf_word2, "DCACHE Miss (W0,W2)",  8, UNIT_BYTES, CYCLE_CPU, XCYCLE_FROM_CPU(40) },
+        { bench_dcache_cwf_word3, "DCACHE Miss (W0,W3)",  8, UNIT_BYTES, CYCLE_CPU, XCYCLE_FROM_CPU(40) },
+
+        { bench_dcache_cwf_row,   "DCACHE Miss row",     4, UNIT_BYTES, CYCLE_CPU, XCYCLE_FROM_CPU(44) },
+
+        { bench_dcache_miss_write_sw,    "DCACHE Miss W (sw)",    4, UNIT_BYTES, CYCLE_CPU, XCYCLE_FROM_CPU(35) },
+        { bench_dcache_miss_write_sb,    "DCACHE Miss W (sb)",    1, UNIT_BYTES, CYCLE_CPU, XCYCLE_FROM_CPU(35) },
+        { bench_dcache_miss_write_sw_lw, "DCACHE Miss W (sw lw)", 8, UNIT_BYTES, CYCLE_CPU, XCYCLE_FROM_CPU(39) },
+        { bench_dcache_miss_write_sw_sw, "DCACHE Miss W (sw sw)", 8, UNIT_BYTES, CYCLE_CPU, XCYCLE_FROM_CPU(39) },
+
+        { bench_rcp_io_r,         "RCP I/O R",   1,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(23) },
+        { bench_rcp_io_w,         "RCP I/O W",   1,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(29) },
+        { bench_rcp_io_w_after_r, "RCP I/O R+W", 1,   UNIT_BYTES, CYCLE_CPU,  XCYCLE_FROM_CPU(1) },
 
         { bench_pidma, "PI DMA",        8,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(193) },
         { bench_pidma, "PI DMA",      128,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(1591) },
@@ -593,6 +1546,9 @@ int main(void)
 
         { bench_piior, "PI I/O R",   4,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(144) },
         { bench_piiow, "PI I/O W",   4,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(134) },
+
+        { bench_piior_dom2, "PI I/O R DOM2",   4,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(808) },
+        { bench_piiow_dom2, "PI I/O W DOM2",   4,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(800) },
 
         { bench_sidmaw_ram, "SI DMA W RAM",  64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(4065) },
         { bench_sidmaw_rom, "SI DMA W ROM",  64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(2144) },
@@ -607,12 +1563,70 @@ int main(void)
         { bench_joybus_empty7,  "JOY: Empty 56B",   64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(21170) },
         { bench_joybus_empty7e, "JOY: Empty 63B",   64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(21178) },
         { bench_joybus_1j,      "JOY: 1J",       64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(37987) },
-        { bench_joybus_2j,      "JOY: 2J",       64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(57972) },
+        { bench_joybus_2j,      "JOY: 2J",       64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(57972) }, // target 60965 when a second controller is plugged
         { bench_joybus_3j,      "JOY: 3J",       64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(77924) },
         { bench_joybus_4j,      "JOY: 4J",       64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(97890) },
         { bench_joybus_access,  "JOY: Accessory",64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(36834) },
+        { bench_joybus_access_read,  "JOY: AccessRead",64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(99172) },
+        { bench_joybus_access_write, "JOY: AccessWrite",64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(101289) },
+
+        { bench_joybus_wempty0,  "JOY: W Empty 0B",    64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(9180) },
+        { bench_joybus_wempty0b, "JOY: W Empty 1B",    64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(10586) },
+        { bench_joybus_wempty0c, "JOY: W Empty 4B",    64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(14811) },
+        { bench_joybus_wempty1,  "JOY: W Empty 8B",    64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(15323) },
+        { bench_joybus_wempty4,  "JOY: W Empty 32B",   64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(15324) },
+        { bench_joybus_wempty7,  "JOY: W Empty 56B",   64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(15328) },
+        { bench_joybus_wempty7e, "JOY: W Empty 63B",   64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(15323) },
+        { bench_joybus_w1j,      "JOY: W 1J",       64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(15707) },
+        { bench_joybus_w2j,      "JOY: W 2J",       64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(22237) },
+        { bench_joybus_w3j,      "JOY: W 3J",       64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(28764) },
+        { bench_joybus_w4j,      "JOY: W 4J",       64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(35293) },
+        { bench_joybus_waccess,  "JOY: WAccessory",64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(16865) },
+        { bench_joybus_waccess_read,  "JOY: WAccessRead",64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(15714) },
+        { bench_joybus_waccess_write, "JOY: WAccessWrite",64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(14754) },
+
+        { bench_6105w,  "6105 challenge w",64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(4128) },
+        { bench_6105r,  "6105 challenge r",64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(676768) },
+
+        { bench_eeprom_r_parse,  "eeprom r parse",64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(19745) },
+        { bench_eeprom_r_exe,    "eeprom r exe",64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(52646) },
+        { bench_eeprom_w_parse,  "eeprom w parse",64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(19749) },
+        { bench_eeprom_w_exe,    "eeprom w exe",64,   UNIT_BYTES, CYCLE_RCP,  XCYCLE_FROM_RCP(52899) },
+
+        { bench_sp_io_dmem_r,    "SP DMEM IO R", 4, UNIT_BYTES, CYCLE_CPU, XCYCLE_FROM_CPU(29) },
+        { bench_sp_io_dmem_w,    "SP DMEM IO W", 4, UNIT_BYTES, CYCLE_CPU, XCYCLE_FROM_CPU(35) },
+        { bench_sp_io_imem_r,    "SP IMEM IO R", 4, UNIT_BYTES, CYCLE_CPU, XCYCLE_FROM_CPU(29) },
+        { bench_sp_io_imem_w,    "SP IMEM IO W", 4, UNIT_BYTES, CYCLE_CPU, XCYCLE_FROM_CPU(39) },
+        { bench_spdma_read, "SPDMAR 4", BUILD_SP_LEN_REG(1,4,0), UNIT_BYTES, CYCLE_RCP, XCYCLE_FROM_RCP(34) },
+        { bench_spdma_read, "SPDMAR 8", BUILD_SP_LEN_REG(1,8,0), UNIT_BYTES, CYCLE_RCP, XCYCLE_FROM_RCP(35) },
+        { bench_spdma_read, "SPDMAR 80", BUILD_SP_LEN_REG(1,0x80,0), UNIT_BYTES, CYCLE_RCP, XCYCLE_FROM_RCP(50) },
+        { bench_spdma_read, "SPDMAR 800", BUILD_SP_LEN_REG(1,0x800,0), UNIT_BYTES, CYCLE_RCP, XCYCLE_FROM_RCP(339) },
+        { bench_spdma_read, "SPDMAR 1000", BUILD_SP_LEN_REG(1,0x1000,0), UNIT_BYTES, CYCLE_RCP, XCYCLE_FROM_RCP(653) },
+        { bench_spdma_read, "SPDMAR 8*(8+8)", BUILD_SP_LEN_REG(8,8,8), UNIT_BYTES, CYCLE_RCP, XCYCLE_FROM_RCP(136) },
+        { bench_spdma_read, "SPDMAR 80*400", BUILD_SP_LEN_REG(0x80,0x400,0), UNIT_BYTES, CYCLE_RCP, XCYCLE_FROM_RCP(20079) },
+        { bench_spdma_read, "SPDMAR 400*(400+100)", BUILD_SP_LEN_REG(0x400,0x400,0x100), UNIT_BYTES, CYCLE_RCP, XCYCLE_FROM_RCP(40289) },
+
+        { bench_spdma_write, "SPDMAW 4", BUILD_SP_LEN_REG(1,4,0), UNIT_BYTES, CYCLE_RCP, XCYCLE_FROM_RCP(34) },
+        { bench_spdma_write, "SPDMAW 8", BUILD_SP_LEN_REG(1,8,0), UNIT_BYTES, CYCLE_RCP, XCYCLE_FROM_RCP(34) },
+        { bench_spdma_write, "SPDMAW 80", BUILD_SP_LEN_REG(1,0x80,0), UNIT_BYTES, CYCLE_RCP, XCYCLE_FROM_RCP(50) },
+        { bench_spdma_write, "SPDMAW 800", BUILD_SP_LEN_REG(1,0x800,0), UNIT_BYTES, CYCLE_RCP, XCYCLE_FROM_RCP(327) },
+        { bench_spdma_write, "SPDMAW 1000", BUILD_SP_LEN_REG(1,0x1000,0), UNIT_BYTES, CYCLE_RCP, XCYCLE_FROM_RCP(623) },
+        { bench_spdma_write, "SPDMAW 8*(8+8)", BUILD_SP_LEN_REG(8,8,8), UNIT_BYTES, CYCLE_RCP, XCYCLE_FROM_RCP(102) },
+        { bench_spdma_write, "SPDMAW 80*400", BUILD_SP_LEN_REG(0x80,0x400,0), UNIT_BYTES, CYCLE_RCP, XCYCLE_FROM_RCP(19176) },
+        { bench_spdma_write, "SPDMAW 400*(400+100)", BUILD_SP_LEN_REG(0x400,0x400,0x100), UNIT_BYTES, CYCLE_RCP, XCYCLE_FROM_RCP(38540) },
+
+        { bench_rdp_fillrect, "RDP FILL RECT(8)", 8, UNIT_BYTES, CYCLE_RCP, XCYCLE_FROM_RCP(10) },
+        { bench_rdp_fillrect, "RDP FILL RECT(80)", 80, UNIT_BYTES, CYCLE_RCP, XCYCLE_FROM_RCP(10) },
+        { bench_rdp_fillrect, "RDP FILL RECT(200)", 200, UNIT_BYTES, CYCLE_RCP, XCYCLE_FROM_RCP(10) },
+
+        //{ bench_flashram_erase_chip, "FLA ERASE CHIP", 1, UNIT_BYTES, CYCLE_CPU, XCYCLE_FROM_CPU(1211) }
     };
 
+   *((volatile int*)0xa4600024) = 0x5; // PI_BSD_DOM2_LAT
+   *((volatile int*)0xa4600028) = 0xC; // PI_BSD_DOM2_PWD
+   *((volatile int*)0xa460002C) = 0xF; // PI_BSD_DOM2_PGS
+   *((volatile int*)0xa4600030) = 0x2; // PI_BSD_DOM2_RLS
+     
     rsp_init();
     debug_init_isviewer();
     debug_init_usblog();
@@ -684,18 +1698,19 @@ int main(void)
     SI_regs->status = SI_WSTATUS_INTACK;
 
     enable_interrupts();
-    controller_init();
+    joypad_init();
     display_init( RESOLUTION_640x240, DEPTH_32_BPP, 2, GAMMA_NONE, ANTIALIAS_RESAMPLE );
+   
     while(1) {
         char sbuf[1024];
         display_context_t disp;
-        while (!(disp = display_lock())) {}
-        controller_scan();
-        struct controller_data cont = get_keys_down();
+        while (!(disp = display_get())) {}
+        joypad_poll();
+        joypad_buttons_t cont = joypad_get_buttons_pressed(JOYPAD_PORT_1);
 
-        if (cont.c->start) page = 0;
-        if (cont.c->L) page = (page - 1) % num_pages;
-        if (cont.c->R) page = (page + 1) % num_pages;
+        if (cont.start) page = 0;
+        if (cont.l) page = (page - 1) % num_pages;
+        if (cont.r) page = (page + 1) % num_pages;
         
         graphics_fill_screen(disp, 0);
         sprintf(sbuf, "Page %d/%d", page+1, num_pages);
@@ -738,6 +1753,15 @@ int main(void)
 
             graphics_draw_text(disp, 320-110, 140, "Press L/R to navigate pages");
 
+	    /*sprintf(sbuf, "cycles cop1: %d [%x,%x] -> [%x,%x], new:%d", cyclesCop1, (int)minRange1, (int)minRange2, (int)maxRange1, (int)maxRange2, cycles);
+	    graphics_draw_text(disp, 40, 160, sbuf);*/
+
+	    /*sprintf(sbuf, "deltas: %d %d %d %d %d %d %d %d", deltas[0], deltas[1], deltas[2], deltas[3], deltas[4], deltas[5], deltas[6], deltas[7]);
+	    graphics_draw_text(disp, 10, 160, sbuf);
+
+	    sprintf(sbuf, "deltas: %d %d %d %d %d %d %d %d", deltas[8], deltas[9], deltas[10], deltas[11], deltas[12], deltas[13], deltas[14], deltas[15]);
+	    graphics_draw_text(disp, 10, 170, sbuf);*/
+
             display_show(disp);
         } break;
         default: { // Details
@@ -755,9 +1779,16 @@ int main(void)
                 else if (b->passed_30p) graphics_set_color(colors[3], 0);
                 else                    graphics_set_color(colors[4], 0);
 
-                sprintf(sbuf, "%20s %7d | %4s | %7lld | %7lld | %+7lld (%+02.1f%%)",
-                    b->name, b->qty, cycletype_name(b->cycletype),
-                    expected, found, found-expected, (float)(found - expected) * 100.0f / (float)expected);
+	        if(b->qty < 10000000) {
+		   sprintf(sbuf, "%20s %7d | %4s | %7lld | %7lld | %+7lld (%+02.1f%%)",
+			   b->name, b->qty, cycletype_name(b->cycletype),
+			   expected, found, found-expected, (float)(found - expected) * 100.0f / (float)expected);
+		} else {
+		   sprintf(sbuf, "%20s ------- | %4s | %7lld | %7lld | %+7lld (%+02.1f%%)",
+			   b->name, cycletype_name(b->cycletype),
+			   expected, found, found-expected, (float)(found - expected) * 100.0f / (float)expected);
+		}
+	       
                 graphics_draw_text(disp, 20, y, sbuf);
                 y += 10;
             }
